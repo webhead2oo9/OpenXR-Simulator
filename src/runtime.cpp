@@ -726,6 +726,8 @@ static std::unordered_map<XrSpace, RefSpace> g_referenceSpaces;
 
 // Map XrPath to path string for controller detection
 static std::unordered_map<XrPath, std::string> g_pathStrings;
+static std::unordered_map<std::string, XrPath> g_stringPaths;
+static XrPath g_nextPath{1};
 
 // Interaction profiles the app suggested bindings for, in suggestion order, and
 // the one xrGetCurrentInteractionProfile reports back once action sets attach.
@@ -2576,6 +2578,32 @@ extern "C" __declspec(dllexport) XrResult XRAPI_CALL xrNegotiateLoaderRuntimeInt
             Log("[SimXR] xrNegotiateLoaderRuntimeInterface: ERROR - null parameters");
             return XR_ERROR_INITIALIZATION_FAILED;
         }
+        if (loaderInfo->structType != XR_LOADER_INTERFACE_STRUCT_LOADER_INFO ||
+            loaderInfo->structVersion != XR_LOADER_INFO_STRUCT_VERSION ||
+            loaderInfo->structSize != sizeof(XrNegotiateLoaderInfo) ||
+            runtimeRequest->structType != XR_LOADER_INTERFACE_STRUCT_RUNTIME_REQUEST ||
+            runtimeRequest->structVersion != XR_RUNTIME_INFO_STRUCT_VERSION ||
+            runtimeRequest->structSize != sizeof(XrNegotiateRuntimeRequest) ||
+            loaderInfo->minInterfaceVersion > XR_CURRENT_LOADER_RUNTIME_VERSION ||
+            loaderInfo->maxInterfaceVersion < XR_CURRENT_LOADER_RUNTIME_VERSION) {
+            return XR_ERROR_INITIALIZATION_FAILED;
+        }
+        const uint32_t runtimeMajor = XR_VERSION_MAJOR(kRuntimeApiVersion);
+        const uint32_t runtimeMinor = XR_VERSION_MINOR(kRuntimeApiVersion);
+        const auto beforeRuntime = [&](XrVersion version) {
+            return XR_VERSION_MAJOR(version) < runtimeMajor ||
+                   (XR_VERSION_MAJOR(version) == runtimeMajor &&
+                    XR_VERSION_MINOR(version) <= runtimeMinor);
+        };
+        const auto afterRuntime = [&](XrVersion version) {
+            return XR_VERSION_MAJOR(version) > runtimeMajor ||
+                   (XR_VERSION_MAJOR(version) == runtimeMajor &&
+                    XR_VERSION_MINOR(version) >= runtimeMinor);
+        };
+        if (!beforeRuntime(loaderInfo->minApiVersion) ||
+            !afterRuntime(loaderInfo->maxApiVersion)) {
+            return XR_ERROR_INITIALIZATION_FAILED;
+        }
         
         // The loader FreeLibrary's the runtime after xrDestroyInstance. That drops the last
         // reference this process may hold on d3d12/dxgi/opengl32, and unloading those out
@@ -2589,16 +2617,17 @@ extern "C" __declspec(dllexport) XrResult XRAPI_CALL xrNegotiateLoaderRuntimeInt
         }
 
         Logf("[SimXR] xrNegotiateLoaderRuntimeInterface: loaderInfo=%p, runtimeRequest=%p", loaderInfo, runtimeRequest);
-        Logf("[SimXR]   Loader minInterfaceVersion=%u, maxInterfaceVersion=%u, minApiVersion=0x%X, maxApiVersion=0x%X",
+        Logf("[SimXR]   Loader minInterfaceVersion=%u, maxInterfaceVersion=%u, minApiVersion=0x%llX, maxApiVersion=0x%llX",
              loaderInfo->minInterfaceVersion, loaderInfo->maxInterfaceVersion,
-             loaderInfo->minApiVersion, loaderInfo->maxApiVersion);
+             (unsigned long long)loaderInfo->minApiVersion,
+             (unsigned long long)loaderInfo->maxApiVersion);
         
         runtimeRequest->runtimeInterfaceVersion = XR_CURRENT_LOADER_RUNTIME_VERSION;
         runtimeRequest->getInstanceProcAddr = xrGetInstanceProcAddr_runtime;
         runtimeRequest->runtimeApiVersion = kRuntimeApiVersion;
         
-        Logf("[SimXR] xrNegotiateLoaderRuntimeInterface: SUCCESS - runtimeApiVersion=0x%X (%u)", 
-             runtimeRequest->runtimeApiVersion, runtimeRequest->runtimeApiVersion);
+        Logf("[SimXR] xrNegotiateLoaderRuntimeInterface: SUCCESS - runtimeApiVersion=0x%llX",
+             (unsigned long long)runtimeRequest->runtimeApiVersion);
         return XR_SUCCESS;
     } catch (...) {
         Log("[SimXR] xrNegotiateLoaderRuntimeInterface: EXCEPTION caught!");
@@ -3016,6 +3045,9 @@ static XrResult XRAPI_PTR xrDestroyInstance_runtime(XrInstance instance) {
         rt::g_sessionActionSetsAttached = false;
         rt::g_suggestedProfiles.clear();
         rt::g_activeProfile = XR_NULL_PATH;
+        rt::g_pathStrings.clear();
+        rt::g_stringPaths.clear();
+        rt::g_nextPath = 1;
 
         // MUST destroy the window before DLL unloads!
         // The OpenXR loader may unload our DLL after this call.
@@ -8742,29 +8774,32 @@ static XrResult XRAPI_PTR xrSyncActions_runtime(XrSession session, const XrActio
     return XR_SUCCESS;
 }
 
-static XrResult XRAPI_PTR xrStringToPath_runtime(XrInstance, const char* pathString, XrPath* path) {
+static XrResult XRAPI_PTR xrStringToPath_runtime(XrInstance instance, const char* pathString, XrPath* path) {
+    if (!IsValidInstance(instance)) return XR_ERROR_HANDLE_INVALID;
     if (!pathString || !path) return XR_ERROR_VALIDATION_FAILURE;
-    // Simple hash as path ID
-    size_t hash = 5381;
-    for (const char* c = pathString; *c; ++c) {
-        hash = ((hash << 5) + hash) + *c;
+    if (!api_validation::IsWellFormedPath(pathString)) return XR_ERROR_PATH_FORMAT_INVALID;
+    auto existing = rt::g_stringPaths.find(pathString);
+    if (existing != rt::g_stringPaths.end()) {
+        *path = existing->second;
+        return XR_SUCCESS;
     }
-    *path = (XrPath)hash;
-    // Store path string for controller detection
-    rt::g_pathStrings[*path] = pathString;
+    if (rt::g_nextPath == XR_NULL_PATH) return XR_ERROR_PATH_COUNT_EXCEEDED;
+    *path = rt::g_nextPath++;
+    rt::g_pathStrings.emplace(*path, pathString);
+    rt::g_stringPaths.emplace(pathString, *path);
     Logf("[SimXR] xrStringToPath: %s -> %llu", pathString, (unsigned long long)*path);
     return XR_SUCCESS;
 }
 
-static XrResult XRAPI_PTR xrPathToString_runtime(XrInstance, XrPath path, uint32_t bufferCapacityInput, uint32_t* bufferCountOutput, char* buffer) {
+static XrResult XRAPI_PTR xrPathToString_runtime(XrInstance instance, XrPath path, uint32_t bufferCapacityInput, uint32_t* bufferCountOutput, char* buffer) {
+    if (!IsValidInstance(instance)) return XR_ERROR_HANDLE_INVALID;
     auto it = rt::g_pathStrings.find(path);
     if (it == rt::g_pathStrings.end()) return XR_ERROR_PATH_INVALID;
     const std::string& str = it->second;
     const uint32_t len = (uint32_t)str.size() + 1;
-    if (bufferCountOutput) *bufferCountOutput = len;
-    if (bufferCapacityInput == 0) return XR_SUCCESS;  // sizing call
-    if (!buffer) return XR_ERROR_VALIDATION_FAILURE;
-    if (bufferCapacityInput < len) return XR_ERROR_SIZE_INSUFFICIENT;
+    const XrResult validation = api_validation::ValidateEnumeration(
+        bufferCapacityInput, bufferCountOutput, buffer, len);
+    if (XR_FAILED(validation) || bufferCapacityInput == 0) return validation;
     std::memcpy(buffer, str.c_str(), len);
     return XR_SUCCESS;
 }

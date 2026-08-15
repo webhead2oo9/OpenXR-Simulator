@@ -3,6 +3,7 @@
 #include <openxr/openxr.h>
 
 #include <cstdint>
+#include <cstring>
 
 namespace api_validation {
 
@@ -14,6 +15,35 @@ inline XrResult ValidateApiVersion(XrVersion requested, XrVersion supported) {
         return XR_ERROR_API_VERSION_UNSUPPORTED;
     }
     return XR_SUCCESS;
+}
+
+inline bool IsWellFormedPath(const char* path) {
+    if (!path) return false;
+    const size_t length = strnlen(path, XR_MAX_PATH_LENGTH);
+    if (length < 2 || length == XR_MAX_PATH_LENGTH || path[0] != '/' ||
+        path[length - 1] == '/') {
+        return false;
+    }
+    size_t segmentStart = 1;
+    for (size_t index = 1; index <= length; ++index) {
+        const char value = index == length ? '/' : path[index];
+        const bool allowed = (value >= 'a' && value <= 'z') ||
+                             (value >= '0' && value <= '9') || value == '-' ||
+                             value == '_' || value == '.' || value == '/';
+        if (!allowed) return false;
+        if (value != '/') continue;
+        if (index == segmentStart) return false;
+        bool onlyPeriods = true;
+        for (size_t character = segmentStart; character < index; ++character) {
+            if (path[character] != '.') {
+                onlyPeriods = false;
+                break;
+            }
+        }
+        if (onlyPeriods) return false;
+        segmentStart = index + 1;
+    }
+    return true;
 }
 
 template <typename T>

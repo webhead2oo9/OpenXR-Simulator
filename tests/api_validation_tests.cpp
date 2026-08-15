@@ -20,6 +20,16 @@ int main() {
     Check(api_validation::ValidateApiVersion(XR_MAKE_VERSION(1, 1, 0), supported) ==
               XR_ERROR_API_VERSION_UNSUPPORTED,
           "a newer minor version is rejected");
+    Check(api_validation::IsWellFormedPath("/user/hand/left"),
+          "a normal semantic path is well formed");
+    Check(!api_validation::IsWellFormedPath("user/hand/left"),
+          "a path must begin with a slash");
+    Check(!api_validation::IsWellFormedPath("/user//left"),
+          "a path cannot contain an empty level");
+    Check(!api_validation::IsWellFormedPath("/user/../left"),
+          "a path level cannot contain only periods");
+    Check(!api_validation::IsWellFormedPath("/User/hand"),
+          "a path cannot contain uppercase characters");
 
     uint32_t count = 0;
     int values[2]{};
