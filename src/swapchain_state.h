@@ -60,6 +60,10 @@ public:
         return XR_SUCCESS;
     }
 
+    bool IsAppOwned(uint32_t index) const {
+        return index < states_.size() && states_[index] != ImageState::Available;
+    }
+
 private:
     std::vector<ImageState> states_;
     std::deque<uint32_t> acquired_;

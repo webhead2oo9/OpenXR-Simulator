@@ -27,6 +27,7 @@ int main() {
     uint32_t first = UINT32_MAX, second = UINT32_MAX, third = UINT32_MAX;
     Check(lifecycle.Acquire(first) == XR_SUCCESS && first == 0,
           "first image is acquired");
+    Check(lifecycle.IsAppOwned(first), "an acquired image is owned by the application");
     Check(lifecycle.Acquire(second) == XR_SUCCESS && second == 1,
           "multiple images may be acquired");
     Check(lifecycle.Acquire(third) == XR_SUCCESS && third == 2,
@@ -42,6 +43,7 @@ int main() {
           "the waited image must be released before the next wait");
     Check(lifecycle.Release(index) == XR_SUCCESS && index == first,
           "release selects the oldest waited acquisition");
+    Check(!lifecycle.IsAppOwned(first), "a released image is no longer owned by the application");
     Check(lifecycle.Acquire(index) == XR_SUCCESS && index == first,
           "a released non-static image becomes available again");
 

@@ -118,6 +118,7 @@ static PFNGLCHECKFRAMEBUFFERSTATUSPROC g_glCheckFramebufferStatus = nullptr;
 #include <loader_interfaces.h>
 #include "mcp_integration.h"
 #include "action_state.h"
+#include "composition_validation.h"
 #include "frame_state.h"
 #include "pose_math.h"
 #include "projection_timing.h"
@@ -541,7 +542,7 @@ struct Session {
 struct Swapchain {
     XrSwapchain handle{(XrSwapchain)1};
     DXGI_FORMAT format{DXGI_FORMAT_R8G8B8A8_UNORM};
-    uint32_t width{0}, height{0}, arraySize{2};
+    uint32_t width{0}, height{0}, arraySize{2}, faceCount{1};
     uint32_t mipCount{1};
     // Backend type and images
     enum class Backend { D3D11, D3D12, OpenGL } backend{Backend::D3D11};
@@ -3460,6 +3461,7 @@ static XrResult XRAPI_PTR xrCreateSwapchain_runtime(XrSession session, const XrS
     chain.width = ci->width; 
     chain.height = ci->height; 
     chain.arraySize = ci->arraySize;
+    chain.faceCount = ci->faceCount;
     chain.imageCount = (ci->createFlags & XR_SWAPCHAIN_CREATE_STATIC_IMAGE_BIT) ? 1u : 3u;
     chain.lifecycle.Reset(chain.imageCount,
         (ci->createFlags & XR_SWAPCHAIN_CREATE_STATIC_IMAGE_BIT) != 0);
@@ -7359,6 +7361,126 @@ static void consumeCompletedPreviewFrame(rt::Session& s) {
     paintPreviewComposite(s, f);
 }
 
+static bool IsExtensionEnabled(const char* name) {
+    return std::find(rt::g_instance.enabledExtensions.begin(), rt::g_instance.enabledExtensions.end(), name) !=
+        rt::g_instance.enabledExtensions.end();
+}
+
+static bool IsCompositionSpace(XrSpace space) {
+    return rt::g_referenceSpaces.find(space) != rt::g_referenceSpaces.end() ||
+        rt::g_controllerSpaces.find(space) != rt::g_controllerSpaces.end();
+}
+
+static XrResult ValidateCompositionSubImage(const XrSwapchainSubImage& subImage) {
+    auto it = rt::g_swapchains.find(subImage.swapchain);
+    if (it == rt::g_swapchains.end()) return XR_ERROR_HANDLE_INVALID;
+    const rt::Swapchain& chain = it->second;
+    const bool released = chain.lastReleased != UINT32_MAX &&
+        chain.lastReleased < chain.imageCount && !chain.lifecycle.IsAppOwned(chain.lastReleased);
+    return composition_validation::ValidateSubImage(subImage, {
+        chain.width, chain.height, chain.arraySize, chain.faceCount, released,
+    });
+}
+
+static XrResult ValidateProjectionView(const XrCompositionLayerProjectionView& view) {
+    if (view.type != XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW) return XR_ERROR_VALIDATION_FAILURE;
+    XrResult result = ValidateCompositionSubImage(view.subImage);
+    if (XR_FAILED(result)) return result;
+
+    for (const XrBaseInStructure* next = reinterpret_cast<const XrBaseInStructure*>(view.next);
+         next; next = next->next) {
+        if (next->type != XR_TYPE_COMPOSITION_LAYER_DEPTH_INFO_KHR) continue;
+        if (!IsExtensionEnabled(XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME)) {
+            return XR_ERROR_VALIDATION_FAILURE;
+        }
+        const auto* depth = reinterpret_cast<const XrCompositionLayerDepthInfoKHR*>(next);
+        result = ValidateCompositionSubImage(depth->subImage);
+        if (XR_FAILED(result)) return result;
+        if (!std::isfinite(depth->minDepth) || !std::isfinite(depth->maxDepth) ||
+            depth->minDepth < 0.0f || depth->maxDepth > 1.0f ||
+            depth->minDepth >= depth->maxDepth ||
+            !(depth->nearZ > 0.0f) || !(depth->farZ > 0.0f) ||
+            depth->nearZ == depth->farZ) {
+            return XR_ERROR_VALIDATION_FAILURE;
+        }
+    }
+    return XR_SUCCESS;
+}
+
+static XrResult ValidateFrameSubmission(const XrFrameEndInfo& info) {
+    if (info.displayTime <= 0) return XR_ERROR_TIME_INVALID;
+    if (info.environmentBlendMode != XR_ENVIRONMENT_BLEND_MODE_OPAQUE) {
+        return XR_ERROR_ENVIRONMENT_BLEND_MODE_UNSUPPORTED;
+    }
+    if (info.layerCount > 16) return XR_ERROR_LAYER_LIMIT_EXCEEDED;
+    if (info.layerCount > 0 && !info.layers) return XR_ERROR_VALIDATION_FAILURE;
+
+    constexpr XrCompositionLayerFlags validLayerFlags =
+        XR_COMPOSITION_LAYER_CORRECT_CHROMATIC_ABERRATION_BIT |
+        XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT |
+        XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
+    for (uint32_t i = 0; i < info.layerCount; ++i) {
+        const XrCompositionLayerBaseHeader* base = info.layers[i];
+        if (!base) return XR_ERROR_LAYER_INVALID;
+        if (base->layerFlags & ~validLayerFlags) return XR_ERROR_VALIDATION_FAILURE;
+        if (!IsCompositionSpace(base->space)) return XR_ERROR_HANDLE_INVALID;
+
+        XrResult result = XR_SUCCESS;
+        switch (base->type) {
+            case XR_TYPE_COMPOSITION_LAYER_PROJECTION: {
+                const auto* projection = reinterpret_cast<const XrCompositionLayerProjection*>(base);
+                if (projection->viewCount != 2 || !projection->views) {
+                    return XR_ERROR_VALIDATION_FAILURE;
+                }
+                for (uint32_t view = 0; view < projection->viewCount; ++view) {
+                    result = ValidateProjectionView(projection->views[view]);
+                    if (XR_FAILED(result)) return result;
+                }
+                break;
+            }
+            case XR_TYPE_COMPOSITION_LAYER_QUAD: {
+                const auto* quad = reinterpret_cast<const XrCompositionLayerQuad*>(base);
+                if (quad->eyeVisibility != XR_EYE_VISIBILITY_BOTH &&
+                    quad->eyeVisibility != XR_EYE_VISIBILITY_LEFT &&
+                    quad->eyeVisibility != XR_EYE_VISIBILITY_RIGHT) {
+                    return XR_ERROR_VALIDATION_FAILURE;
+                }
+                if (!std::isfinite(quad->size.width) || !std::isfinite(quad->size.height) ||
+                    quad->size.width < 0.0f || quad->size.height < 0.0f) {
+                    return XR_ERROR_VALIDATION_FAILURE;
+                }
+                result = ValidateCompositionSubImage(quad->subImage);
+                if (XR_FAILED(result)) return result;
+                break;
+            }
+            case XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR: {
+                if (!IsExtensionEnabled(XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME)) {
+                    return XR_ERROR_LAYER_INVALID;
+                }
+                const auto* cylinder = reinterpret_cast<const XrCompositionLayerCylinderKHR*>(base);
+                if (cylinder->eyeVisibility != XR_EYE_VISIBILITY_BOTH &&
+                    cylinder->eyeVisibility != XR_EYE_VISIBILITY_LEFT &&
+                    cylinder->eyeVisibility != XR_EYE_VISIBILITY_RIGHT) {
+                    return XR_ERROR_VALIDATION_FAILURE;
+                }
+                constexpr float twoPi = 6.28318530717958647692f;
+                if (std::isnan(cylinder->radius) || cylinder->radius < 0.0f ||
+                    !std::isfinite(cylinder->centralAngle) || cylinder->centralAngle < 0.0f ||
+                    cylinder->centralAngle >= twoPi || !std::isfinite(cylinder->aspectRatio) ||
+                    cylinder->aspectRatio <= 0.0f) {
+                    return XR_ERROR_VALIDATION_FAILURE;
+                }
+                result = ValidateCompositionSubImage(cylinder->subImage);
+                if (XR_FAILED(result)) return result;
+                break;
+            }
+            default:
+                return XR_ERROR_LAYER_INVALID;
+        }
+    }
+    return XR_SUCCESS;
+}
+
 static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession session, const XrFrameEndInfo* info) {
     if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
     if (!info || info->type != XR_TYPE_FRAME_END_INFO) return XR_ERROR_VALIDATION_FAILURE;
@@ -7367,6 +7489,8 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession session, const XrFrameEnd
         if (!rt::g_session.running) return XR_ERROR_SESSION_NOT_RUNNING;
         if (!rt::g_session.frameLifecycle.CanEnd()) return XR_ERROR_CALL_ORDER_INVALID;
     }
+    const XrResult validation = ValidateFrameSubmission(*info);
+    if (XR_FAILED(validation)) return validation;
 
     // Reentrance guard: when our preview swapchain calls Present(), Steam's overlay
     // (gameoverlayrenderer64) hooks it, which can trigger UEVR to re-submit frames
@@ -7469,7 +7593,7 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession session, const XrFrameEnd
                 break;
             }
             case XR_TYPE_COMPOSITION_LAYER_QUAD: quadCount++; break;
-            case (XrStructureType)37: cylinderCount++; break; // XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR
+            case XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR: cylinderCount++; break;
             default: otherCount++; break;
         }
     }
@@ -7560,7 +7684,7 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession session, const XrFrameEnd
                 renderQuadLayer(rt::g_session, quad);
                 break;
             }
-            case (XrStructureType)37: {
+            case XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR: {
                 // TODO: Implement cylinder layer rendering
                 break;
             }

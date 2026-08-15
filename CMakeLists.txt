@@ -72,6 +72,10 @@ if(BUILD_TESTING)
     add_executable(frame_state_tests tests/frame_state_tests.cpp)
     target_include_directories(frame_state_tests PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/include)
     add_test(NAME frame_state COMMAND frame_state_tests)
+
+    add_executable(composition_validation_tests tests/composition_validation_tests.cpp)
+    target_include_directories(composition_validation_tests PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/include)
+    add_test(NAME composition_validation COMMAND composition_validation_tests)
 endif()
 
 # Link libraries
