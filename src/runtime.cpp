@@ -119,6 +119,7 @@ static PFNGLCHECKFRAMEBUFFERSTATUSPROC g_glCheckFramebufferStatus = nullptr;
 #include "action_state.h"
 #include "pose_math.h"
 #include "projection_timing.h"
+#include "swapchain_state.h"
 #include "ui_enhancements.h"
 
 using Microsoft::WRL::ComPtr;
@@ -551,15 +552,16 @@ struct Swapchain {
     std::vector<HANDLE> sharedHandles;
     std::vector<GLuint> imagesGL;                     // OpenGL path
     GLenum glInternalFormat{GL_RGBA8};                // OpenGL internal format
-    uint32_t nextIndex{0};
     uint32_t lastAcquired{UINT32_MAX};  // Initialize to invalid
     uint32_t lastReleased{UINT32_MAX};  // Initialize to invalid
     uint32_t imageCount{3};
+    swapchain_state::Lifecycle lifecycle;
 };
 
 static Instance g_instance{};
 static Session g_session{};
 static std::unordered_map<XrSwapchain, Swapchain> g_swapchains;
+static uintptr_t g_nextSwapchainHandle{2};
 
 // Head tracking state for mouse look and WASD movement
 static XrVector3f g_headPos = {0.0f, 1.7f, 0.0f};  // Start at standing eye height
@@ -2346,7 +2348,6 @@ static XrResult CreateSwapchainImages(rt::Session& s, rt::Swapchain& chain, cons
     chain.format = fp->typed;
     chain.backend = rt::Swapchain::Backend::D3D12;
     chain.mipCount = mips;
-    chain.imageCount = 3;
 
     D3D12_RESOURCE_DESC rd{};
     rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -3233,6 +3234,28 @@ static XrResult XRAPI_PTR xrDestroySession_runtime(XrSession s) {
         }
     }
     
+    // Destroy all child swapchains while their graphics devices/contexts are still valid.
+    // Destroying the parent session implicitly destroys these handles.
+    if (rt::g_session.usesD3D12) rt::WaitForPreviewIdle(rt::g_session);
+    if (rt::g_session.usesOpenGL) {
+        HGLRC previousRC = wglGetCurrentContext();
+        HDC previousDC = wglGetCurrentDC();
+        if (rt::g_session.glDC && rt::g_session.glRC) {
+            wglMakeCurrent(rt::g_session.glDC, rt::g_session.glRC);
+        }
+        for (auto& entry : rt::g_swapchains) {
+            for (GLuint texture : entry.second.imagesGL) glDeleteTextures(1, &texture);
+        }
+        if (previousRC) wglMakeCurrent(previousDC, previousRC);
+    }
+    if (rt::g_session.usesVulkan) {
+        for (auto& entry : rt::g_swapchains) {
+            if (entry.second.isVulkan) vkrt::DestroySwapchainImages(rt::g_session, entry.second);
+        }
+        vkrt::ShutdownSession(rt::g_session);
+    }
+    rt::g_swapchains.clear();
+
     // Reset session but don't destroy the window
     rt::g_session.handle = XR_NULL_HANDLE;
     rt::g_session.state = XR_SESSION_STATE_IDLE;
@@ -3240,14 +3263,6 @@ static XrResult XRAPI_PTR xrDestroySession_runtime(XrSession s) {
     rt::g_session.d3d11Context.Reset();
     rt::g_session.usesD3D12 = false;
     rt::ResetD3D12PreviewResources(rt::g_session);
-    if (rt::g_session.usesVulkan) {
-        // The images live on the app's VkDevice, which goes away right after this call, so
-        // they cannot wait for an xrDestroySwapchain the app may never make.
-        for (auto& sc : rt::g_swapchains) {
-            if (sc.second.isVulkan) vkrt::DestroySwapchainImages(rt::g_session, sc.second);
-        }
-        vkrt::ShutdownSession(rt::g_session);
-    }
     rt::g_session.d3d12Device.Reset();
     rt::g_session.d3d12Queue.Reset();
     // Reset OpenGL state
@@ -3268,17 +3283,19 @@ static XrResult XRAPI_PTR xrDestroySession_runtime(XrSession s) {
     return XR_SUCCESS;
 }
 
-static XrResult XRAPI_PTR xrEnumerateSwapchainFormats_runtime(XrSession, uint32_t capacity, uint32_t* count, int64_t* formats) {
+static XrResult XRAPI_PTR xrEnumerateSwapchainFormats_runtime(XrSession session, uint32_t capacity, uint32_t* count, int64_t* formats) {
+    if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
+    if (!count) return XR_ERROR_VALIDATION_FAILURE;
     // Vulkan path - VkFormat values, in the order an app should prefer them
     if (rt::g_session.usesVulkan) {
         const uint32_t formatCount = (uint32_t)std::size(vkrt::kFormats);
-        if (count) *count = formatCount;
-        if (capacity > 0 && formats) {
-            const uint32_t copyCount = (capacity < formatCount) ? capacity : formatCount;
-            for (uint32_t i = 0; i < copyCount; ++i) formats[i] = vkrt::kFormats[i].vk;
+        *count = formatCount;
+        if (capacity == 0) return XR_SUCCESS;
+        if (!formats) return XR_ERROR_VALIDATION_FAILURE;
+        if (capacity < formatCount) return XR_ERROR_SIZE_INSUFFICIENT;
+        for (uint32_t i = 0; i < formatCount; ++i) formats[i] = vkrt::kFormats[i].vk;
             Logf("[SimXR] xrEnumerateSwapchainFormats(Vulkan): %u formats (first: VkFormat %lld)",
-                 copyCount, (long long)formats[0]);
-        }
+                 formatCount, (long long)formats[0]);
         return XR_SUCCESS;
     }
 
@@ -3296,14 +3313,14 @@ static XrResult XRAPI_PTR xrEnumerateSwapchainFormats_runtime(XrSession, uint32_
         };
         const uint32_t formatCount = sizeof(supportedFormats) / sizeof(supportedFormats[0]);
 
-        if (count) *count = formatCount;
-        if (capacity > 0 && formats) {
-            uint32_t copyCount = (capacity < formatCount) ? capacity : formatCount;
-            for (uint32_t i = 0; i < copyCount; ++i) {
-                formats[i] = supportedFormats[i];
-            }
-            Logf("[SimXR] xrEnumerateSwapchainFormats(OpenGL): Returned %u formats (first: 0x%X)", copyCount, (int)formats[0]);
+        *count = formatCount;
+        if (capacity == 0) return XR_SUCCESS;
+        if (!formats) return XR_ERROR_VALIDATION_FAILURE;
+        if (capacity < formatCount) return XR_ERROR_SIZE_INSUFFICIENT;
+        for (uint32_t i = 0; i < formatCount; ++i) {
+            formats[i] = supportedFormats[i];
         }
+        Logf("[SimXR] xrEnumerateSwapchainFormats(OpenGL): Returned %u formats (first: 0x%X)", formatCount, (int)formats[0]);
         return XR_SUCCESS;
     }
 
@@ -3323,18 +3340,18 @@ static XrResult XRAPI_PTR xrEnumerateSwapchainFormats_runtime(XrSession, uint32_
     };
     const uint32_t formatCount = sizeof(supportedFormats) / sizeof(supportedFormats[0]);
 
-    if (count) *count = formatCount;
-    if (capacity > 0 && formats) {
-        uint32_t copyCount = (capacity < formatCount) ? capacity : formatCount;
-        for (uint32_t i = 0; i < copyCount; ++i) {
-            formats[i] = supportedFormats[i];
-        }
-        Logf("[SimXR] xrEnumerateSwapchainFormats: Returned %u formats (first: %d)", copyCount, (int)formats[0]);
+    *count = formatCount;
+    if (capacity == 0) return XR_SUCCESS;
+    if (!formats) return XR_ERROR_VALIDATION_FAILURE;
+    if (capacity < formatCount) return XR_ERROR_SIZE_INSUFFICIENT;
+    for (uint32_t i = 0; i < formatCount; ++i) {
+        formats[i] = supportedFormats[i];
     }
+    Logf("[SimXR] xrEnumerateSwapchainFormats: Returned %u formats (first: %d)", formatCount, (int)formats[0]);
     return XR_SUCCESS;
 }
 
-static XrResult XRAPI_PTR xrCreateSwapchain_runtime(XrSession, const XrSwapchainCreateInfo* ci, XrSwapchain* sc) {
+static XrResult XRAPI_PTR xrCreateSwapchain_runtime(XrSession session, const XrSwapchainCreateInfo* ci, XrSwapchain* sc) {
     Log("[SimXR] ============================================");
     Logf("[SimXR] xrCreateSwapchain called: format=%d, size=%ux%u, arraySize=%u, mipCount=%u, sampleCount=%u, usageFlags=0x%X",
          ci ? (int)ci->format : -1, 
@@ -3364,13 +3381,61 @@ static XrResult XRAPI_PTR xrCreateSwapchain_runtime(XrSession, const XrSwapchain
     }
     
     Log("[SimXR] ============================================");
-    if (!ci || !sc) return XR_ERROR_VALIDATION_FAILURE;
+    if (!ci || !sc || ci->type != XR_TYPE_SWAPCHAIN_CREATE_INFO) return XR_ERROR_VALIDATION_FAILURE;
+    if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
+    if (ci->width == 0 || ci->height == 0 || ci->arraySize == 0 || ci->mipCount == 0 ||
+        ci->sampleCount == 0 || (ci->faceCount != 1 && ci->faceCount != 6)) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+    if (ci->width > 4096 || ci->height > 4096) return XR_ERROR_VALIDATION_FAILURE;
+    constexpr XrSwapchainCreateFlags supportedCreateFlags = XR_SWAPCHAIN_CREATE_STATIC_IMAGE_BIT;
+    if (ci->createFlags & ~supportedCreateFlags) return XR_ERROR_FEATURE_UNSUPPORTED;
+
+    const auto formatSupported = [&]() {
+        if (rt::g_session.usesVulkan) return vkrt::FindFormat(ci->format) != nullptr;
+        if (rt::g_session.usesOpenGL) {
+            switch (ci->format) {
+                case GL_SRGB8_ALPHA8:
+                case GL_RGBA8:
+                case GL_RGBA16F:
+                case GL_RGBA32F:
+                case GL_RGB10_A2:
+                case GL_DEPTH_COMPONENT32F:
+                case GL_DEPTH24_STENCIL8:
+                case GL_DEPTH_COMPONENT16:
+                    return true;
+                default:
+                    return false;
+            }
+        }
+        switch (static_cast<DXGI_FORMAT>(ci->format)) {
+            case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:
+            case DXGI_FORMAT_R8G8B8A8_UNORM:
+            case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:
+            case DXGI_FORMAT_B8G8R8A8_UNORM:
+            case DXGI_FORMAT_R16G16B16A16_FLOAT:
+            case DXGI_FORMAT_R32G32B32A32_FLOAT:
+            case DXGI_FORMAT_R10G10B10A2_UNORM:
+            case DXGI_FORMAT_D32_FLOAT_S8X24_UINT:
+            case DXGI_FORMAT_D32_FLOAT:
+            case DXGI_FORMAT_D24_UNORM_S8_UINT:
+            case DXGI_FORMAT_D16_UNORM:
+                return true;
+            default:
+                return false;
+        }
+    };
+    if (!formatSupported()) return XR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED;
+
     rt::Swapchain chain{}; 
-    chain.handle = (XrSwapchain)(uintptr_t)(rt::g_swapchains.size() + 2);
+    chain.handle = reinterpret_cast<XrSwapchain>(rt::g_nextSwapchainHandle++);
     chain.format = (DXGI_FORMAT)ci->format;  // Store the original requested format
     chain.width = ci->width; 
     chain.height = ci->height; 
-    chain.arraySize = ci->arraySize ? ci->arraySize : 1;
+    chain.arraySize = ci->arraySize;
+    chain.imageCount = (ci->createFlags & XR_SWAPCHAIN_CREATE_STATIC_IMAGE_BIT) ? 1u : 3u;
+    chain.lifecycle.Reset(chain.imageCount,
+        (ci->createFlags & XR_SWAPCHAIN_CREATE_STATIC_IMAGE_BIT) != 0);
     chain.lastAcquired = UINT32_MAX;  // No image acquired yet
     chain.lastReleased = UINT32_MAX;  // No image released yet
     // Create textures on appropriate backend
@@ -3388,7 +3453,6 @@ static XrResult XRAPI_PTR xrCreateSwapchain_runtime(XrSession, const XrSwapchain
     }
     if (rt::g_session.usesD3D12) {
         chain.backend = rt::Swapchain::Backend::D3D12;
-        chain.imageCount = 3;
         for (uint32_t i = 0; i < chain.imageCount; ++i) {
             D3D12_RESOURCE_DESC rd = {};
             rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
@@ -3469,7 +3533,6 @@ static XrResult XRAPI_PTR xrCreateSwapchain_runtime(XrSession, const XrSwapchain
     // OpenGL path
     if (rt::g_session.usesOpenGL) {
         chain.backend = rt::Swapchain::Backend::OpenGL;
-        chain.imageCount = 3;
 
         // Check the current GL context state
         HGLRC currentRC = wglGetCurrentContext();
@@ -3687,7 +3750,6 @@ static XrResult XRAPI_PTR xrCreateSwapchain_runtime(XrSession, const XrSwapchain
     // Log the texture description for debugging
     Logf("[SimXR] Creating swapchain textures: Format=%d, %ux%u, Array=%u, Mips=%u, Samples=%u",
          td.Format, td.Width, td.Height, td.ArraySize, td.MipLevels, td.SampleDesc.Count);
-    chain.imageCount = 3;
     for (uint32_t i = 0; i < chain.imageCount; ++i) {
         ComPtr<ID3D11Texture2D> tex; 
         HRESULT hr = rt::g_session.d3d11Device->CreateTexture2D(&td, nullptr, tex.GetAddressOf());
@@ -3717,39 +3779,47 @@ static XrResult XRAPI_PTR xrCreateSwapchain_runtime(XrSession, const XrSwapchain
 
 static XrResult XRAPI_PTR xrEnumerateSwapchainImages_runtime(XrSwapchain sc, uint32_t capacity, uint32_t* count, XrSwapchainImageBaseHeader* images) {
     auto it = rt::g_swapchains.find(sc); if (it == rt::g_swapchains.end()) return XR_ERROR_HANDLE_INVALID;
+    if (!count) return XR_ERROR_VALIDATION_FAILURE;
+    const uint32_t n = it->second.isVulkan
+        ? static_cast<uint32_t>(it->second.imagesVk.size())
+        : it->second.backend == rt::Swapchain::Backend::D3D12
+            ? static_cast<uint32_t>(it->second.images12.size())
+            : it->second.backend == rt::Swapchain::Backend::OpenGL
+                ? static_cast<uint32_t>(it->second.imagesGL.size())
+                : static_cast<uint32_t>(it->second.images.size());
+    *count = n;
+    if (capacity == 0) return XR_SUCCESS;
+    if (!images) return XR_ERROR_VALIDATION_FAILURE;
+    if (capacity < n) return XR_ERROR_SIZE_INSUFFICIENT;
+
     if (it->second.isVulkan) {
         // XrSwapchainImageVulkan2KHR is a typedef of XrSwapchainImageVulkanKHR, so this is
         // the right shape for both extensions.
-        const uint32_t n = (uint32_t)it->second.imagesVk.size();
-        if (count) *count = n;
-        if (capacity >= n && images) {
-            auto* arr = reinterpret_cast<XrSwapchainImageVulkanKHR*>(images);
-            for (uint32_t i = 0; i < n; ++i) { arr[i].type = XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR; arr[i].image = it->second.imagesVk[i]; }
+        auto* arr = reinterpret_cast<XrSwapchainImageVulkanKHR*>(images);
+        for (uint32_t i = 0; i < n; ++i) {
+            if (arr[i].type != XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR) return XR_ERROR_VALIDATION_FAILURE;
+            arr[i].image = it->second.imagesVk[i];
         }
         Logf("[SimXR] xrEnumerateSwapchainImages(Vulkan): sc=%p count=%u", sc, n);
         return XR_SUCCESS;
     }
     if (it->second.backend == rt::Swapchain::Backend::D3D12) {
-        const uint32_t n = (uint32_t)it->second.images12.size();
-        if (count) *count = n;
-        if (capacity >= n && images) {
-            auto* arr = reinterpret_cast<XrSwapchainImageD3D12KHR*>(images);
-            for (uint32_t i = 0; i < n; ++i) { arr[i].type = XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR; arr[i].texture = it->second.images12[i].Get(); }
+        auto* arr = reinterpret_cast<XrSwapchainImageD3D12KHR*>(images);
+        for (uint32_t i = 0; i < n; ++i) {
+            if (arr[i].type != XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR) return XR_ERROR_VALIDATION_FAILURE;
+            arr[i].texture = it->second.images12[i].Get();
         }
         Logf("[SimXR] xrEnumerateSwapchainImages(D3D12): sc=%p count=%u", sc, n);
         return XR_SUCCESS;
     } else if (it->second.backend == rt::Swapchain::Backend::OpenGL) {
-        const uint32_t n = (uint32_t)it->second.imagesGL.size();
-        if (count) *count = n;
-        if (capacity >= n && images) {
-            auto* arr = reinterpret_cast<XrSwapchainImageOpenGLKHR*>(images);
-            for (uint32_t i = 0; i < n; ++i) {
-                arr[i].type = XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_KHR;
-                arr[i].image = it->second.imagesGL[i];
-            }
+        auto* arr = reinterpret_cast<XrSwapchainImageOpenGLKHR*>(images);
+        for (uint32_t i = 0; i < n; ++i) {
+            if (arr[i].type != XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_KHR) return XR_ERROR_VALIDATION_FAILURE;
+            arr[i].image = it->second.imagesGL[i];
+        }
             // DEBUG: Log the texture IDs being returned AND verify content still matches
             Logf("[SimXR] xrEnumerateSwapchainImages(OpenGL): sc=%p texIDs=[%u,%u,%u]",
-                 sc, n > 0 ? arr[0].image : 0, n > 1 ? arr[1].image : 0, n > 2 ? arr[2].image : 0);
+                  sc, n > 0 ? arr[0].image : 0, n > 1 ? arr[1].image : 0, n > 2 ? arr[2].image : 0);
 
             // DEBUG: Read first texture to verify it still has content
             if (n > 0 && EnsureGLFramebufferFuncs()) {
@@ -3767,29 +3837,29 @@ static XrResult XRAPI_PTR xrEnumerateSwapchainImages_runtime(XrSwapchain sc, uin
                 g_glBindFramebuffer(GL_FRAMEBUFFER, 0);
                 g_glDeleteFramebuffers(1, &checkFBO);
             }
-        } else {
-            Logf("[SimXR] xrEnumerateSwapchainImages(OpenGL): sc=%p count=%u (query only)", sc, n);
-        }
         return XR_SUCCESS;
     } else {
-        const uint32_t n = (uint32_t)it->second.images.size();
-        if (count) *count = n;
-        if (capacity >= n && images) {
-            auto* arr = reinterpret_cast<XrSwapchainImageD3D11KHR*>(images);
-            for (uint32_t i = 0; i < n; ++i) { arr[i].type = XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR; arr[i].texture = it->second.images[i].Get(); }
+        auto* arr = reinterpret_cast<XrSwapchainImageD3D11KHR*>(images);
+        for (uint32_t i = 0; i < n; ++i) {
+            if (arr[i].type != XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR) return XR_ERROR_VALIDATION_FAILURE;
+            arr[i].texture = it->second.images[i].Get();
         }
         Logf("[SimXR] xrEnumerateSwapchainImages(D3D11): sc=%p count=%u", sc, n);
         return XR_SUCCESS;
     }
 }
 
-static XrResult XRAPI_PTR xrAcquireSwapchainImage_runtime(XrSwapchain sc, const XrSwapchainImageAcquireInfo*, uint32_t* index) {
+static XrResult XRAPI_PTR xrAcquireSwapchainImage_runtime(XrSwapchain sc, const XrSwapchainImageAcquireInfo* info, uint32_t* index) {
+    if (!index || (info && info->type != XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO)) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
     auto it = rt::g_swapchains.find(sc); if (it == rt::g_swapchains.end()) return XR_ERROR_HANDLE_INVALID;
     auto& ch = it->second;
-    uint32_t i = ch.nextIndex;
-    ch.nextIndex = (ch.nextIndex + 1) % ch.imageCount;
+    uint32_t i = UINT32_MAX;
+    const XrResult result = ch.lifecycle.Acquire(i);
+    if (XR_FAILED(result)) return result;
     ch.lastAcquired = i;  // Track what we just gave to the app
-    if (index) *index = i; 
+    *index = i;
     
     static int acquireCount = 0;
     ++acquireCount;
@@ -3801,13 +3871,22 @@ static XrResult XRAPI_PTR xrAcquireSwapchainImage_runtime(XrSwapchain sc, const 
     }
     return XR_SUCCESS;
 }
-static XrResult XRAPI_PTR xrWaitSwapchainImage_runtime(XrSwapchain, const XrSwapchainImageWaitInfo*) { return XR_SUCCESS; }
-static XrResult XRAPI_PTR xrReleaseSwapchainImage_runtime(XrSwapchain sc, const XrSwapchainImageReleaseInfo*) {
+static XrResult XRAPI_PTR xrWaitSwapchainImage_runtime(XrSwapchain sc, const XrSwapchainImageWaitInfo* info) {
+    if (!info || info->type != XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO) return XR_ERROR_VALIDATION_FAILURE;
+    auto it = rt::g_swapchains.find(sc);
+    if (it == rt::g_swapchains.end()) return XR_ERROR_HANDLE_INVALID;
+    uint32_t waited = UINT32_MAX;
+    return it->second.lifecycle.Wait(waited);
+}
+static XrResult XRAPI_PTR xrReleaseSwapchainImage_runtime(XrSwapchain sc, const XrSwapchainImageReleaseInfo* info) {
+    if (info && info->type != XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO) return XR_ERROR_VALIDATION_FAILURE;
     auto it = rt::g_swapchains.find(sc);
     if (it == rt::g_swapchains.end()) return XR_ERROR_HANDLE_INVALID;
     auto& ch = it->second;
-    // The app just released the image it acquired earlier
-    ch.lastReleased = ch.lastAcquired;
+    uint32_t released = UINT32_MAX;
+    const XrResult result = ch.lifecycle.Release(released);
+    if (XR_FAILED(result)) return result;
+    ch.lastReleased = released;
 
     // For D3D12: the app has finished using this image, reset our tracked state to COMMON.
     // D3D12 implicit state promotion/decay means COMMON is always safe after a GPU sync point.
