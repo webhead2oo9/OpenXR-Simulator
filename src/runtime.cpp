@@ -522,6 +522,8 @@ struct Session {
     // instead of being reallocated per frame.
     std::vector<uint8_t> glEyePixels[2];
     std::vector<uint8_t> glQuadPixels;
+    std::vector<uint8_t> glEyeReadback[2];
+    std::vector<uint8_t> glQuadReadback;
     ComPtr<ID3D11Texture2D> glEyeTex[2];
     ComPtr<ID3D11ShaderResourceView> glEyeSrv[2];
     UINT glEyeTexW{0}, glEyeTexH{0};
@@ -5425,6 +5427,31 @@ static ID3D11Texture2D* acquireTempTexture(rt::Session& s, rt::Session::TempTexE
     return entry.texture.Get();
 }
 
+// glGetTexImage always returns the complete mip level (and every layer of a texture array).
+// Read into a correctly-sized reusable scratch buffer first, then extract only the OpenXR
+// subimage. Writing it directly into a crop-sized destination corrupts memory whenever an
+// application submits less than the full swapchain image.
+static bool readGLSubImage(GLuint texture, const rt::Swapchain& chain, uint32_t arrayIndex,
+                           const rt::SubImageRect& rect, std::vector<uint8_t>& scratch,
+                           std::vector<uint8_t>& output, uint32_t outputWidth,
+                           uint32_t outputHeight) {
+    const uint32_t layers = chain.arraySize ? chain.arraySize : 1;
+    const uint64_t layerBytes64 = (uint64_t)chain.width * chain.height * 4;
+    if (!texture || layerBytes64 == 0 || layerBytes64 > SIZE_MAX) return false;
+    const size_t layerBytes = (size_t)layerBytes64;
+    if (layers > SIZE_MAX / layerBytes) return false;
+    scratch.resize(layerBytes * layers);
+
+    const GLenum target = layers > 1 ? GL_TEXTURE_2D_ARRAY : GL_TEXTURE_2D;
+    glBindTexture(target, texture);
+    glPixelStorei(GL_PACK_ALIGNMENT, 1);
+    glGetTexImage(target, 0, GL_RGBA, GL_UNSIGNED_BYTE, scratch.data());
+
+    return composition_render::CopyRgbaSubImage(
+        scratch.data(), scratch.size(), chain.width, chain.height, layers, arrayIndex,
+        rect, outputWidth, outputHeight, output);
+}
+
 static void blitViewToHalf(rt::Session& s, rt::Swapchain& chain, uint32_t srcIndex, uint32_t arraySlice,
                            const XrRect2Di& rect, ID3D11RenderTargetView* rtv,
                            const D3D11_VIEWPORT& vp, ID3D11BlendState* blendState) {
@@ -6189,8 +6216,8 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
             // Read pixel data from GL textures into CPU buffers
             std::vector<uint8_t>& leftPixels = s.glEyePixels[0];    // reused across frames
             std::vector<uint8_t>& rightPixels = s.glEyePixels[1];
-            leftPixels.resize((size_t)width * height * 4);
-            rightPixels.resize((size_t)width * height * 4);
+            leftPixels.assign((size_t)width * height * 4, 0);
+            rightPixels.assign((size_t)width * height * 4, 0);
 
             // Get left eye texture
             GLuint leftTex = 0;
@@ -6204,7 +6231,8 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
 
             // Get right eye texture
             GLuint rightTex = 0;
-            if (rectR.w > 0 && rectR.h > 0 && chRPtr && chRPtr->imagesGL.size() > 0) {
+            if (proj.viewCount > 1 && rectR.w > 0 && rectR.h > 0 &&
+                chRPtr && chRPtr->imagesGL.size() > 0) {
                 uint32_t idx = chRPtr->lastReleased;
                 if (idx == UINT32_MAX || idx >= chRPtr->imageCount) idx = chRPtr->lastAcquired;
                 if (idx != UINT32_MAX && idx < chRPtr->imagesGL.size()) {
@@ -6212,16 +6240,17 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
                 }
             }
 
-            // Read left eye pixels using glGetTexImage
+            // glGetTexImage cannot crop. Read the complete image safely, then copy only
+            // the submitted rectangle into the common per-eye preview canvas.
             if (leftTex != 0) {
-                glBindTexture(GL_TEXTURE_2D, leftTex);
-                glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, leftPixels.data());
+                readGLSubImage(leftTex, chL, vL.subImage.imageArrayIndex, rectL,
+                               s.glEyeReadback[0], leftPixels, width, height);
             }
 
-            // Read right eye pixels
+            // Read right eye pixels.
             if (rightTex != 0) {
-                glBindTexture(GL_TEXTURE_2D, rightTex);
-                glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, rightPixels.data());
+                readGLSubImage(rightTex, *chRPtr, proj.views[1].subImage.imageArrayIndex, rectR,
+                               s.glEyeReadback[1], rightPixels, width, height);
             }
 
             // Flip images vertically - OpenGL has Y=0 at bottom, D3D expects Y=0 at top
@@ -6990,38 +7019,14 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) 
             Logf("[SimXR] Quad texture check: glTex=%u, glIsTexture=%d", glTex, isValid);
         }
 
-        // Read pixels from GL texture using FBO (more reliable than glGetTexImage)
+        // Read the complete texture into safe scratch storage, then extract the exact
+        // submitted array slice and crop. An FBO read of (0,0,width,height) incorrectly
+        // ignored imageRect offsets, while glGetTexImage wrote past this crop-sized buffer.
         std::vector<uint8_t>& pixels = s.glQuadPixels;   // reused across frames
-        pixels.resize((size_t)texWidth * texHeight * 4);
-
-        // Try FBO method first if available
-        bool usedFBO = false;
-        if (EnsureGLFramebufferFuncs()) {
-            // Create a temporary FBO to read the texture
-            GLuint readFBO = 0;
-            g_glGenFramebuffers(1, &readFBO);
-            g_glBindFramebuffer(GL_FRAMEBUFFER, readFBO);
-            g_glFramebufferTexture2D(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_TEXTURE_2D, glTex, 0);
-
-            GLenum fboStatus = g_glCheckFramebufferStatus(GL_FRAMEBUFFER);
-            if (fboStatus == GL_FRAMEBUFFER_COMPLETE) {
-                glReadPixels(0, 0, texWidth, texHeight, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
-                usedFBO = true;
-            } else {
-                if (shouldLog) {
-                    Logf("[SimXR] Quad FBO not complete: status=0x%X, falling back to glGetTexImage", fboStatus);
-                }
-            }
-
-            // Cleanup FBO
-            g_glBindFramebuffer(GL_FRAMEBUFFER, 0);
-            g_glDeleteFramebuffers(1, &readFBO);
-        }
-
-        // Fallback to glGetTexImage
-        if (!usedFBO) {
-            glBindTexture(GL_TEXTURE_2D, glTex);
-            glGetTexImage(GL_TEXTURE_2D, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels.data());
+        if (!readGLSubImage(glTex, chain, quad->subImage.imageArrayIndex, qrect,
+                            s.glQuadReadback, pixels, texWidth, texHeight)) {
+            if (savedRC) wglMakeCurrent(savedDC, savedRC);
+            return;
         }
 
         // Debug: check pixel values before flip

@@ -4,6 +4,9 @@
 
 #include <algorithm>
 #include <cstdint>
+#include <cstring>
+#include <limits>
+#include <vector>
 
 namespace composition_render {
 
@@ -70,6 +73,38 @@ inline bool HasPixels(const XrCompositionLayerProjection& projection) {
 inline bool HasPixels(const XrCompositionLayerQuad& quad) {
     return quad.size.width > 0.0f && quad.size.height > 0.0f &&
            HasPixels(quad.subImage.imageRect);
+}
+
+inline bool CopyRgbaSubImage(const uint8_t* source, size_t sourceBytes,
+                             uint32_t textureWidth, uint32_t textureHeight,
+                             uint32_t arraySize, uint32_t arrayIndex,
+                             const SubImageRect& rect, uint32_t outputWidth,
+                             uint32_t outputHeight, std::vector<uint8_t>& output) {
+    const uint64_t outputBytes64 = (uint64_t)outputWidth * outputHeight * 4;
+    if (outputBytes64 > std::numeric_limits<size_t>::max()) return false;
+    output.assign((size_t)outputBytes64, 0);
+
+    const uint64_t layerBytes64 = (uint64_t)textureWidth * textureHeight * 4;
+    const uint32_t layers = arraySize ? arraySize : 1;
+    if (!source || layerBytes64 == 0 || layerBytes64 > std::numeric_limits<size_t>::max() ||
+        layers > std::numeric_limits<size_t>::max() / (size_t)layerBytes64 ||
+        sourceBytes < (size_t)layerBytes64 * layers || arrayIndex >= layers ||
+        rect.w == 0 || rect.h == 0 || outputWidth < rect.w || outputHeight < rect.h ||
+        (uint64_t)rect.x + rect.w > textureWidth ||
+        (uint64_t)rect.y + rect.h > textureHeight) {
+        return false;
+    }
+
+    const size_t layerBytes = (size_t)layerBytes64;
+    const uint8_t* layer = source + layerBytes * arrayIndex;
+    const size_t destinationPitch = (size_t)outputWidth * 4;
+    for (uint32_t row = 0; row < rect.h; ++row) {
+        const uint8_t* sourceRow =
+            layer + ((size_t)(rect.y + row) * textureWidth + rect.x) * 4;
+        uint8_t* destinationRow = output.data() + (size_t)row * destinationPitch;
+        std::memcpy(destinationRow, sourceRow, (size_t)rect.w * 4);
+    }
+    return true;
 }
 
 } // namespace composition_render

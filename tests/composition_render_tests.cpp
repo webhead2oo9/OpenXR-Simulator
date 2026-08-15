@@ -65,6 +65,20 @@ int main() {
     quad.size.width = 0.0f;
     Check(!composition_render::HasPixels(quad), "a zero-width quad contributes no pixels");
 
+    // Two 3x2 RGBA layers with the first byte identifying each pixel.
+    std::vector<uint8_t> source(3 * 2 * 2 * 4, 0);
+    for (size_t pixel = 0; pixel < source.size() / 4; ++pixel) source[pixel * 4] = (uint8_t)pixel;
+    std::vector<uint8_t> copied;
+    Check(composition_render::CopyRgbaSubImage(
+              source.data(), source.size(), 3, 2, 2, 1, {1, 0, 2, 2}, 3, 2, copied),
+          "an array-layer crop is copied successfully");
+    Check(copied.size() == 3 * 2 * 4 && copied[0] == 7 && copied[4] == 8 &&
+              copied[8] == 0 && copied[12] == 10 && copied[16] == 11 && copied[20] == 0,
+          "the requested layer and crop are copied with zero padding");
+    Check(!composition_render::CopyRgbaSubImage(
+              source.data(), source.size() - 1, 3, 2, 2, 1, {0, 0, 3, 2}, 3, 2, copied),
+          "a truncated full-texture readback is rejected");
+
     if (failures) return 1;
     std::puts("composition render tests passed");
     return 0;
