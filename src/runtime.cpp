@@ -117,6 +117,7 @@ static PFNGLCHECKFRAMEBUFFERSTATUSPROC g_glCheckFramebufferStatus = nullptr;
 #include <loader_interfaces.h>
 #include "mcp_integration.h"
 #include "action_state.h"
+#include "pose_math.h"
 #include "projection_timing.h"
 #include "ui_enhancements.h"
 
@@ -695,8 +696,11 @@ static ControllerState g_rightController = {
     {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, {0.0f, 0.0f, 0.0f}, 0.0f, 0.0f  // Velocity tracking
 };
 
-// Map XrSpace handles to controller type (0=none, 1=left grip, 2=left aim, 3=right grip, 4=right aim)
-static std::unordered_map<XrSpace, int> g_controllerSpaces;
+struct ActionSpace {
+    int controllerType{0}; // 0 = unbound, 1 = left, 2 = right
+    XrPosef poseInActionSpace{pose_math::Identity()};
+};
+static std::unordered_map<XrSpace, ActionSpace> g_controllerSpaces;
 
 // Composition layers carry a pose plus the space it is in, and VIEW (head-locked)
 // against STAGE (world) changes where the layer belongs entirely.
@@ -817,28 +821,16 @@ XrQuaternionf QuatFromYawPitchRoll(float yaw, float pitch, float roll) {
 }
 
 static inline XrQuaternionf MultiplyQuaternions(const XrQuaternionf& a, const XrQuaternionf& b) {
-    return XrQuaternionf{
-        a.w*b.x + a.x*b.w + a.y*b.z - a.z*b.y,
-        a.w*b.y - a.x*b.z + a.y*b.w + a.z*b.x,
-        a.w*b.z + a.x*b.y - a.y*b.x + a.z*b.w,
-        a.w*b.w - a.x*b.x - a.y*b.y - a.z*b.z
-    };
+    return pose_math::Multiply(a, b);
 }
 
 // Rotate a vector by a quaternion (q * v * q^-1)
 static inline XrVector3f RotateVectorByQuaternion(const XrQuaternionf& q, const XrVector3f& v) {
-    const XrQuaternionf qv{ v.x, v.y, v.z, 0.0f };
-    const XrQuaternionf qinv{ -q.x, -q.y, -q.z, q.w };
-    const XrQuaternionf r = MultiplyQuaternions(MultiplyQuaternions(q, qv), qinv);
-    return XrVector3f{ r.x, r.y, r.z };
+    return pose_math::Rotate(q, v);
 }
 
 static inline XrPosef ComposePose(const XrPosef& parent, const XrPosef& child) {
-    const XrVector3f r = RotateVectorByQuaternion(parent.orientation, child.position);
-    XrPosef out;
-    out.orientation = MultiplyQuaternions(parent.orientation, child.orientation);
-    out.position = { parent.position.x + r.x, parent.position.y + r.y, parent.position.z + r.z };
-    return out;
+    return pose_math::Compose(parent, child);
 }
 
 static void GetEffectiveHeadAngles(float& yaw, float& pitch, float& roll) {
@@ -3270,6 +3262,8 @@ static XrResult XRAPI_PTR xrDestroySession_runtime(XrSession s) {
     rt::g_attachedActionSets.clear();
     rt::g_activeActionSetHands.clear();
     rt::g_sessionActionSetsAttached = false;
+    rt::g_referenceSpaces.clear();
+    rt::g_controllerSpaces.clear();
     Log("[SimXR] xrDestroySession: SUCCESS");
     return XR_SUCCESS;
 }
@@ -7515,26 +7509,66 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
     return XR_SUCCESS;
 }
 
-static XrResult XRAPI_PTR xrLocateViews_runtime(XrSession, const XrViewLocateInfo* li, XrViewState* vs, uint32_t cap, uint32_t* outCount, XrView* views) {
-    if (outCount) *outCount = 2;
-    if (vs) { 
-        vs->type = XR_TYPE_VIEW_STATE; 
-        // Set both VALID and TRACKED bits so Unity knows this is a real tracked HMD
-        vs->viewStateFlags = XR_VIEW_STATE_ORIENTATION_VALID_BIT | 
-                            XR_VIEW_STATE_POSITION_VALID_BIT | 
-                            XR_VIEW_STATE_ORIENTATION_TRACKED_BIT | 
-                            XR_VIEW_STATE_POSITION_TRACKED_BIT; 
+static bool GetSpaceWorldPose(XrSpace space, XrPosef& worldPose, bool& tracked) {
+    auto actionIt = rt::g_controllerSpaces.find(space);
+    if (actionIt != rt::g_controllerSpaces.end()) {
+        const rt::ActionSpace& actionSpace = actionIt->second;
+        if (actionSpace.controllerType == 0) {
+            worldPose = pose_math::Identity();
+            tracked = false;
+            return true;
+        }
+        const rt::ControllerState& controller = actionSpace.controllerType == 1
+            ? rt::g_leftController : rt::g_rightController;
+        if (!controller.isTracking) {
+            worldPose = pose_math::Identity();
+            tracked = false;
+            return true;
+        }
+        XrPosef controllerWorld{};
+        rt::GetControllerPose(controller, &controllerWorld);
+        worldPose = pose_math::Compose(controllerWorld, actionSpace.poseInActionSpace);
+        tracked = true;
+        return true;
     }
-    if (cap < 2 || !views) return XR_SUCCESS;
 
-    // Composition-layer placement reads these same two helpers, which is what keeps
-    // an overlay pinned to the geometry the app renders around it.
+    auto referenceIt = rt::g_referenceSpaces.find(space);
+    if (referenceIt == rt::g_referenceSpaces.end()) return false;
+    XrPosef naturalOrigin = pose_math::Identity();
+    if (referenceIt->second.type == XR_REFERENCE_SPACE_TYPE_VIEW) {
+        float yaw, pitch, roll;
+        rt::GetEffectiveHeadAngles(yaw, pitch, roll);
+        naturalOrigin.orientation = rt::QuatFromYawPitchRoll(yaw, pitch, roll);
+        naturalOrigin.position = rt::g_headPos;
+    }
+    worldPose = pose_math::Compose(naturalOrigin, referenceIt->second.poseInRef);
+    tracked = true;
+    return true;
+}
+
+static XrResult XRAPI_PTR xrLocateViews_runtime(XrSession session, const XrViewLocateInfo* li, XrViewState* vs, uint32_t cap, uint32_t* outCount, XrView* views) {
+    if (!li || !vs || !outCount || li->type != XR_TYPE_VIEW_LOCATE_INFO ||
+        vs->type != XR_TYPE_VIEW_STATE) return XR_ERROR_VALIDATION_FAILURE;
+    if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
+    *outCount = 2;
+
+    XrPosef baseWorld{};
+    bool baseTracked = false;
+    if (!GetSpaceWorldPose(li->space, baseWorld, baseTracked)) return XR_ERROR_HANDLE_INVALID;
+    vs->viewStateFlags = baseTracked
+        ? XR_VIEW_STATE_ORIENTATION_VALID_BIT | XR_VIEW_STATE_POSITION_VALID_BIT |
+          XR_VIEW_STATE_ORIENTATION_TRACKED_BIT | XR_VIEW_STATE_POSITION_TRACKED_BIT
+        : 0;
+    if (cap == 0) return XR_SUCCESS;
+    if (!views) return XR_ERROR_VALIDATION_FAILURE;
+    if (cap < 2) return XR_ERROR_SIZE_INSUFFICIENT;
+
     float effYaw, effPitch, effRoll;
     rt::GetEffectiveHeadAngles(effYaw, effPitch, effRoll);
-
     for (uint32_t i = 0; i < 2; ++i) {
-        views[i].type = XR_TYPE_VIEW;
-        views[i].pose = rt::ViewPoseFromAngles(i, effYaw, effPitch, effRoll);
+        if (views[i].type != XR_TYPE_VIEW) return XR_ERROR_VALIDATION_FAILURE;
+        const XrPosef eyeWorld = rt::ViewPoseFromAngles(i, effYaw, effPitch, effRoll);
+        views[i].pose = pose_math::Relative(eyeWorld, baseWorld);
         views[i].fov = rt::GetViewFov(i);
     }
     static int locateCount = 0;
@@ -7557,73 +7591,47 @@ static XrResult XRAPI_PTR xrCreateReferenceSpace_runtime(XrSession, const XrRefe
 }
 
 static XrResult XRAPI_PTR xrDestroySpace_runtime(XrSpace space) {
-    rt::g_referenceSpaces.erase(space);
+    const size_t erased = rt::g_referenceSpaces.erase(space) + rt::g_controllerSpaces.erase(space);
+    if (!erased) return XR_ERROR_HANDLE_INVALID;
     Logf("[SimXR] xrDestroySpace: space=%p", space);
     return XR_SUCCESS;
 }
 
 static XrResult XRAPI_PTR xrLocateSpace_runtime(XrSpace space, XrSpace baseSpace, XrTime time, XrSpaceLocation* location) {
     if (!location) return XR_ERROR_VALIDATION_FAILURE;
-    location->type = XR_TYPE_SPACE_LOCATION;
+    if (location->type != XR_TYPE_SPACE_LOCATION) return XR_ERROR_VALIDATION_FAILURE;
 
-    // Check if this is a controller space
-    auto it = rt::g_controllerSpaces.find(space);
-    if (it != rt::g_controllerSpaces.end()) {
-        int ctrlType = it->second;
-        const rt::ControllerState& ctrl = (ctrlType == 1) ? rt::g_leftController : rt::g_rightController;
+    XrSpaceVelocity* velocity = reinterpret_cast<XrSpaceVelocity*>(location->next);
+    if (velocity && velocity->type == XR_TYPE_SPACE_VELOCITY) velocity->velocityFlags = 0;
 
-        if (ctrl.isTracking) {
-            location->locationFlags = XR_SPACE_LOCATION_POSITION_VALID_BIT |
-                                      XR_SPACE_LOCATION_ORIENTATION_VALID_BIT |
-                                      XR_SPACE_LOCATION_POSITION_TRACKED_BIT |
-                                      XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
-            rt::GetControllerPose(ctrl, &location->pose);
+    XrPosef spaceWorld{}, baseWorld{};
+    bool spaceTracked = false, baseTracked = false;
+    if (!GetSpaceWorldPose(space, spaceWorld, spaceTracked) ||
+        !GetSpaceWorldPose(baseSpace, baseWorld, baseTracked)) {
+        return XR_ERROR_HANDLE_INVALID;
+    }
 
-            // Handle velocity if chained (XrSpaceVelocity)
-            XrSpaceVelocity* velocity = (XrSpaceVelocity*)location->next;
-            if (velocity && velocity->type == XR_TYPE_SPACE_VELOCITY) {
-                velocity->velocityFlags = XR_SPACE_VELOCITY_LINEAR_VALID_BIT | XR_SPACE_VELOCITY_ANGULAR_VALID_BIT;
-                // Return the calculated velocities from the controller state
-                velocity->linearVelocity = ctrl.linearVelocity;
-                velocity->angularVelocity = ctrl.angularVelocity;
-            }
+    if (!spaceTracked || !baseTracked) {
+        location->locationFlags = 0;
+        location->pose = pose_math::Identity();
+        return XR_SUCCESS;
+    }
 
-            static int logCount = 0;
-            if (++logCount % 500 == 1) {
-                float speed = sqrtf(ctrl.linearVelocity.x * ctrl.linearVelocity.x +
-                                   ctrl.linearVelocity.y * ctrl.linearVelocity.y +
-                                   ctrl.linearVelocity.z * ctrl.linearVelocity.z);
-                Logf("[SimXR] xrLocateSpace: controller %d at (%.2f, %.2f, %.2f) vel=(%.2f, %.2f, %.2f) speed=%.2f m/s",
-                     ctrlType, location->pose.position.x, location->pose.position.y, location->pose.position.z,
-                     ctrl.linearVelocity.x, ctrl.linearVelocity.y, ctrl.linearVelocity.z, speed);
-            }
-        } else {
-            location->locationFlags = 0;
-            location->pose.orientation = {0, 0, 0, 1};
-            location->pose.position = {0, 0, 0};
-        }
-    } else {
-        // Reference spaces (VIEW / LOCAL / STAGE). Report fully-tracked: a real
-        // runtime sets the *_TRACKED_BIT whenever tracking is live, and UEVR's
-        // "first valid poses" gate requires those bits before it will submit.
-        location->locationFlags = XR_SPACE_LOCATION_POSITION_VALID_BIT |
-                                  XR_SPACE_LOCATION_ORIENTATION_VALID_BIT |
-                                  XR_SPACE_LOCATION_POSITION_TRACKED_BIT |
-                                  XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
+    location->locationFlags = XR_SPACE_LOCATION_POSITION_VALID_BIT |
+                              XR_SPACE_LOCATION_ORIENTATION_VALID_BIT |
+                              XR_SPACE_LOCATION_POSITION_TRACKED_BIT |
+                              XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
+    location->pose = pose_math::Relative(spaceWorld, baseWorld);
 
-        auto typeIt = rt::g_referenceSpaces.find(space);
-        XrReferenceSpaceType spaceType = typeIt != rt::g_referenceSpaces.end()
-            ? typeIt->second.type : XR_REFERENCE_SPACE_TYPE_LOCAL;
-        if (spaceType == XR_REFERENCE_SPACE_TYPE_VIEW) {
-            // VIEW space located against LOCAL/STAGE == the current head pose, so
-            // HMD orientation/position actually track (yaw/pitch/roll from MCP).
-            location->pose.orientation = rt::QuatFromYawPitchRoll(rt::g_headYaw, rt::g_headPitch, rt::g_headRoll);
-            location->pose.position = rt::g_headPos;
-        } else {
-            // LOCAL / STAGE are fixed reference frames -> identity.
-            location->pose.orientation = {0, 0, 0, 1};
-            location->pose.position = {0, 0, 0};
-        }
+    auto actionIt = rt::g_controllerSpaces.find(space);
+    if (actionIt != rt::g_controllerSpaces.end() && actionIt->second.controllerType != 0 &&
+        velocity && velocity->type == XR_TYPE_SPACE_VELOCITY) {
+        const rt::ControllerState& controller = actionIt->second.controllerType == 1
+            ? rt::g_leftController : rt::g_rightController;
+        const XrQuaternionf worldToBase = pose_math::Inverse(baseWorld.orientation);
+        velocity->velocityFlags = XR_SPACE_VELOCITY_LINEAR_VALID_BIT | XR_SPACE_VELOCITY_ANGULAR_VALID_BIT;
+        velocity->linearVelocity = pose_math::Rotate(worldToBase, controller.linearVelocity);
+        velocity->angularVelocity = pose_math::Rotate(worldToBase, controller.angularVelocity);
     }
     return XR_SUCCESS;
 }
@@ -7653,10 +7661,10 @@ static XrResult XRAPI_PTR xrCreateActionSpace_runtime(XrSession, const XrActionS
         if (it != rt::g_pathStrings.end()) {
             const std::string& pathStr = it->second;
             Logf("[SimXR] xrCreateActionSpace: found path='%s'", pathStr.c_str());
-            if (pathStr.find("/user/hand/left") != std::string::npos) {
+            if (pathStr == "/user/hand/left") {
                 controllerType = 1;  // Left controller
                 Logf("[SimXR] xrCreateActionSpace: LEFT controller space %llu", (unsigned long long)*space);
-            } else if (pathStr.find("/user/hand/right") != std::string::npos) {
+            } else if (pathStr == "/user/hand/right") {
                 controllerType = 2;  // Right controller
                 Logf("[SimXR] xrCreateActionSpace: RIGHT controller space %llu", (unsigned long long)*space);
             }
@@ -7667,9 +7675,7 @@ static XrResult XRAPI_PTR xrCreateActionSpace_runtime(XrSession, const XrActionS
         Log("[SimXR] xrCreateActionSpace: subactionPath is XR_NULL_PATH");
     }
 
-    if (controllerType > 0) {
-        rt::g_controllerSpaces[*space] = controllerType;
-    }
+    rt::g_controllerSpaces[*space] = rt::ActionSpace{controllerType, info->poseInActionSpace};
 
     Log("[SimXR] xrCreateActionSpace");
     return XR_SUCCESS;

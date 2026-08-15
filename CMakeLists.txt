@@ -60,6 +60,10 @@ if(BUILD_TESTING)
     add_executable(action_state_tests tests/action_state_tests.cpp)
     target_include_directories(action_state_tests PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/include)
     add_test(NAME action_state COMMAND action_state_tests)
+
+    add_executable(pose_math_tests tests/pose_math_tests.cpp)
+    target_include_directories(pose_math_tests PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/include)
+    add_test(NAME pose_math COMMAND pose_math_tests)
 endif()
 
 # Link libraries
