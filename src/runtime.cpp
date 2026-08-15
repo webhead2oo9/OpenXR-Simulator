@@ -93,8 +93,10 @@ static PFNGLBINDFRAMEBUFFERPROC g_glBindFramebuffer = nullptr;
 static PFNGLFRAMEBUFFERTEXTURE2DPROC g_glFramebufferTexture2D = nullptr;
 static PFNGLCHECKFRAMEBUFFERSTATUSPROC g_glCheckFramebufferStatus = nullptr;
 #include <string>
+#include <array>
 #include <vector>
 #include <unordered_map>
+#include <unordered_set>
 #include <optional>
 #include <cstring>
 #include <cstdlib>
@@ -114,6 +116,7 @@ static PFNGLCHECKFRAMEBUFFERSTATUSPROC g_glCheckFramebufferStatus = nullptr;
 #include <openxr/openxr_platform.h>
 #include <loader_interfaces.h>
 #include "mcp_integration.h"
+#include "action_state.h"
 #include "projection_timing.h"
 #include "ui_enhancements.h"
 
@@ -711,11 +714,47 @@ static std::unordered_map<XrPath, std::string> g_pathStrings;
 static std::vector<XrPath> g_suggestedProfiles;
 static XrPath g_activeProfile = XR_NULL_PATH;
 
-// Map XrAction to action name for input mapping
-static std::unordered_map<XrAction, std::string> g_actionNames;
+enum class ActionInput {
+    Unknown,
+    Trigger,
+    Grip,
+    Menu,
+    Primary,
+    Secondary,
+    Thumbstick,
+    Pose,
+};
 
-// Map XrAction to which hand it's bound to (0=both/any, 1=left, 2=right)
-static std::unordered_map<XrAction, int> g_actionHand;
+struct ActionBinding {
+    XrPath profile{XR_NULL_PATH};
+    XrPath sourcePath{XR_NULL_PATH};
+    std::string collisionKey;
+    int handMask{0}; // 1 = left, 2 = right
+    ActionInput input{ActionInput::Unknown};
+};
+
+struct ActionSetRecord {
+    uint32_t priority{0};
+    bool everAttached{false};
+    std::unordered_set<XrPath> declaredSubactionPaths;
+};
+
+struct ActionRecord {
+    XrActionSet actionSet{XR_NULL_HANDLE};
+    XrActionType type{XR_ACTION_TYPE_BOOLEAN_INPUT};
+    std::string name;
+    int declaredHandMask{3};
+    std::unordered_set<XrPath> declaredSubactionPaths;
+    std::vector<ActionBinding> bindings;
+    // Slot 0 is the combined action state, 1 is left, and 2 is right.
+    std::array<input::ActionSlot, 3> slots;
+};
+
+static std::unordered_map<XrActionSet, ActionSetRecord> g_actionSets;
+static std::unordered_set<XrActionSet> g_attachedActionSets;
+static std::unordered_map<XrActionSet, int> g_activeActionSetHands;
+static std::unordered_map<XrAction, ActionRecord> g_actions;
+static bool g_sessionActionSetsAttached{false};
 
 // Time tracking for velocity calculation
 static XrTime g_lastFrameTime = 0;
@@ -2933,6 +2972,13 @@ static XrResult XRAPI_PTR xrDestroyInstance_runtime(XrInstance instance) {
     if (instance == rt::g_instance.handle) {
         Log("[SimXR] xrDestroyInstance: Clearing global instance");
         rt::g_instance = {};
+        rt::g_actionSets.clear();
+        rt::g_attachedActionSets.clear();
+        rt::g_activeActionSetHands.clear();
+        rt::g_actions.clear();
+        rt::g_sessionActionSetsAttached = false;
+        rt::g_suggestedProfiles.clear();
+        rt::g_activeProfile = XR_NULL_PATH;
 
         // MUST destroy the window before DLL unloads!
         // The OpenXR loader may unload our DLL after this call.
@@ -3221,6 +3267,9 @@ static XrResult XRAPI_PTR xrDestroySession_runtime(XrSession s) {
     rt::g_session.previewHeight = 540;
     rt::g_session.isFocused = false;
     rt::g_activeProfile = XR_NULL_PATH;  // re-bound by the next xrAttachSessionActionSets
+    rt::g_attachedActionSets.clear();
+    rt::g_activeActionSetHands.clear();
+    rt::g_sessionActionSetsAttached = false;
     Log("[SimXR] xrDestroySession: SUCCESS");
     return XR_SUCCESS;
 }
@@ -7626,6 +7675,204 @@ static XrResult XRAPI_PTR xrCreateActionSpace_runtime(XrSession, const XrActionS
     return XR_SUCCESS;
 }
 
+static int HandMaskForTopLevelPath(XrPath path) {
+    auto it = rt::g_pathStrings.find(path);
+    if (it == rt::g_pathStrings.end()) return 0;
+    if (it->second == "/user/hand/left") return 1;
+    if (it->second == "/user/hand/right") return 2;
+    return 0;
+}
+
+static int HandMaskForBindingPath(const std::string& path) {
+    if (path.compare(0, std::strlen("/user/hand/left/"), "/user/hand/left/") == 0) return 1;
+    if (path.compare(0, std::strlen("/user/hand/right/"), "/user/hand/right/") == 0) return 2;
+    return 0;
+}
+
+static rt::ActionInput InputForBindingPath(XrActionType type, const std::string& path) {
+    const auto componentFor = [&](const char* identifier, std::string& component) {
+        const std::string needle = std::string("/input/") + identifier;
+        const size_t pos = path.find(needle);
+        if (pos == std::string::npos) return false;
+        const size_t end = pos + needle.size();
+        if (end == path.size()) {
+            component.clear();
+            return true;
+        }
+        if (path[end] != '/' || path.find('/', end + 1) != std::string::npos) return false;
+        component = path.substr(end + 1);
+        return true;
+    };
+
+    const auto hasConvertibleComponent = [&](const char* identifier, const char* components) {
+        std::string component;
+        if (!componentFor(identifier, component)) return false;
+        if (component.empty()) return true;
+        const std::string allowed = std::string("|") + components + "|";
+        return allowed.find(std::string("|") + component + "|") != std::string::npos;
+    };
+
+    std::string component;
+    if (type == XR_ACTION_TYPE_POSE_INPUT) {
+        if ((componentFor("grip", component) || componentFor("aim", component)) && component == "pose") {
+            return rt::ActionInput::Pose;
+        }
+        return rt::ActionInput::Unknown;
+    }
+    if (type == XR_ACTION_TYPE_BOOLEAN_INPUT) {
+        if (hasConvertibleComponent("trigger", "click|value") ||
+            hasConvertibleComponent("select", "click|value")) return rt::ActionInput::Trigger;
+        if (hasConvertibleComponent("squeeze", "click|value|force") ||
+            hasConvertibleComponent("grip", "click|value|force")) return rt::ActionInput::Grip;
+        if (hasConvertibleComponent("menu", "click")) return rt::ActionInput::Menu;
+        if (hasConvertibleComponent("a", "click") || hasConvertibleComponent("x", "click")) {
+            return rt::ActionInput::Primary;
+        }
+        if (hasConvertibleComponent("b", "click") || hasConvertibleComponent("y", "click")) {
+            return rt::ActionInput::Secondary;
+        }
+        if (hasConvertibleComponent("thumbstick", "click")) return rt::ActionInput::Thumbstick;
+        return rt::ActionInput::Unknown;
+    }
+    if (type == XR_ACTION_TYPE_FLOAT_INPUT) {
+        if (hasConvertibleComponent("trigger", "click|value") ||
+            hasConvertibleComponent("select", "click|value")) return rt::ActionInput::Trigger;
+        if (hasConvertibleComponent("squeeze", "click|value|force") ||
+            hasConvertibleComponent("grip", "click|value|force")) return rt::ActionInput::Grip;
+        return rt::ActionInput::Unknown;
+    }
+    if (type == XR_ACTION_TYPE_VECTOR2F_INPUT) {
+        if (componentFor("thumbstick", component) && component.empty()) return rt::ActionInput::Thumbstick;
+        return rt::ActionInput::Unknown;
+    }
+    return rt::ActionInput::Unknown;
+}
+
+static bool HasPathPrefix(const std::string& path, const char* prefix) {
+    return path.compare(0, std::strlen(prefix), prefix) == 0;
+}
+
+template <size_t N>
+static bool StringIn(const std::string& value, const char* const (&values)[N]) {
+    return std::find_if(std::begin(values), std::end(values), [&](const char* item) {
+        return value == item;
+    }) != std::end(values);
+}
+
+static bool IsSupportedInteractionProfilePath(const std::string& path) {
+    static const char* const profiles[] = {
+        "/interaction_profiles/khr/simple_controller",
+        "/interaction_profiles/google/daydream_controller",
+        "/interaction_profiles/htc/vive_controller",
+        "/interaction_profiles/htc/vive_pro",
+        "/interaction_profiles/microsoft/motion_controller",
+        "/interaction_profiles/microsoft/xbox_controller",
+        "/interaction_profiles/oculus/go_controller",
+        "/interaction_profiles/oculus/touch_controller",
+        "/interaction_profiles/valve/index_controller",
+    };
+    return StringIn(path, profiles);
+}
+
+static bool SplitBindingPath(const std::string& path, std::string& topLevel, std::string& suffix) {
+    static const char* const topLevels[] = {
+        "/user/hand/left", "/user/hand/right", "/user/head", "/user/gamepad",
+    };
+    for (const char* top : topLevels) {
+        const std::string prefix = std::string(top) + "/";
+        if (HasPathPrefix(path, prefix.c_str())) {
+            topLevel = top;
+            suffix = path.substr(prefix.size());
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool IsAllowedBindingPath(const std::string& profile, const std::string& path) {
+    std::string topLevel, suffix;
+    if (!SplitBindingPath(path, topLevel, suffix)) return false;
+
+    static const char* const simple[] = {
+        "input/select/click", "input/menu/click", "input/grip/pose", "input/aim/pose", "output/haptic",
+    };
+    static const char* const daydream[] = {
+        "input/select/click", "input/trackpad/x", "input/trackpad/y", "input/trackpad/click",
+        "input/trackpad/touch", "input/grip/pose", "input/aim/pose",
+    };
+    static const char* const vive[] = {
+        "input/system/click", "input/squeeze/click", "input/menu/click", "input/trigger/click",
+        "input/trigger/value", "input/trackpad/x", "input/trackpad/y", "input/trackpad/click",
+        "input/trackpad/touch", "input/grip/pose", "input/aim/pose", "output/haptic",
+    };
+    static const char* const vivePro[] = {
+        "input/system/click", "input/volume_up/click", "input/volume_down/click", "input/mute_mic/click",
+    };
+    static const char* const motion[] = {
+        "input/menu/click", "input/squeeze/click", "input/trigger/value", "input/thumbstick/x",
+        "input/thumbstick/y", "input/thumbstick/click", "input/trackpad/x", "input/trackpad/y",
+        "input/trackpad/click", "input/trackpad/touch", "input/grip/pose", "input/aim/pose", "output/haptic",
+    };
+    static const char* const xbox[] = {
+        "input/menu/click", "input/view/click", "input/a/click", "input/b/click", "input/x/click",
+        "input/y/click", "input/dpad_down/click", "input/dpad_right/click", "input/dpad_up/click",
+        "input/dpad_left/click", "input/shoulder_left/click", "input/shoulder_right/click",
+        "input/thumbstick_left/click", "input/thumbstick_right/click", "input/trigger_left/value",
+        "input/trigger_right/value", "input/thumbstick_left/x", "input/thumbstick_left/y",
+        "input/thumbstick_right/x", "input/thumbstick_right/y", "output/haptic_left", "output/haptic_right",
+        "output/haptic_left_trigger", "output/haptic_right_trigger",
+    };
+    static const char* const go[] = {
+        "input/system/click", "input/trigger/click", "input/back/click", "input/trackpad/x",
+        "input/trackpad/y", "input/trackpad/click", "input/trackpad/touch", "input/grip/pose", "input/aim/pose",
+    };
+    static const char* const touchCommon[] = {
+        "input/squeeze/value", "input/trigger/value", "input/trigger/touch", "input/thumbstick/x",
+        "input/thumbstick/y", "input/thumbstick/click", "input/thumbstick/touch", "input/thumbrest/touch",
+        "input/grip/pose", "input/aim/pose", "output/haptic",
+    };
+    static const char* const touchLeft[] = {
+        "input/x/click", "input/x/touch", "input/y/click", "input/y/touch", "input/menu/click",
+    };
+    static const char* const touchRight[] = {
+        "input/a/click", "input/a/touch", "input/b/click", "input/b/touch", "input/system/click",
+    };
+    static const char* const index[] = {
+        "input/system/click", "input/system/touch", "input/a/click", "input/a/touch", "input/b/click",
+        "input/b/touch", "input/squeeze/value", "input/squeeze/force", "input/trigger/click",
+        "input/trigger/value", "input/trigger/touch", "input/thumbstick/x", "input/thumbstick/y",
+        "input/thumbstick/click", "input/thumbstick/touch", "input/trackpad/x", "input/trackpad/y",
+        "input/trackpad/force", "input/trackpad/touch", "input/grip/pose", "input/aim/pose", "output/haptic",
+    };
+
+    const bool hand = topLevel == "/user/hand/left" || topLevel == "/user/hand/right";
+    if (profile == "/interaction_profiles/khr/simple_controller") return hand && input::BindingPathAllowed(suffix, simple);
+    if (profile == "/interaction_profiles/google/daydream_controller") return hand && input::BindingPathAllowed(suffix, daydream);
+    if (profile == "/interaction_profiles/htc/vive_controller") return hand && input::BindingPathAllowed(suffix, vive);
+    if (profile == "/interaction_profiles/htc/vive_pro") return topLevel == "/user/head" && input::BindingPathAllowed(suffix, vivePro);
+    if (profile == "/interaction_profiles/microsoft/motion_controller") return hand && input::BindingPathAllowed(suffix, motion);
+    if (profile == "/interaction_profiles/microsoft/xbox_controller") {
+        return topLevel == "/user/gamepad" && input::BindingPathAllowed(suffix, xbox);
+    }
+    if (profile == "/interaction_profiles/oculus/go_controller") return hand && input::BindingPathAllowed(suffix, go);
+    if (profile == "/interaction_profiles/oculus/touch_controller") {
+        return hand && (input::BindingPathAllowed(suffix, touchCommon) ||
+            (topLevel == "/user/hand/left" && input::BindingPathAllowed(suffix, touchLeft)) ||
+            (topLevel == "/user/hand/right" && input::BindingPathAllowed(suffix, touchRight)));
+    }
+    if (profile == "/interaction_profiles/valve/index_controller") return hand && input::BindingPathAllowed(suffix, index);
+    return false;
+}
+
+static XrTime CurrentXrTime() {
+    LARGE_INTEGER counter{}, frequency{};
+    QueryPerformanceCounter(&counter);
+    QueryPerformanceFrequency(&frequency);
+    const long long seconds = counter.QuadPart / frequency.QuadPart;
+    const long long remainder = counter.QuadPart % frequency.QuadPart;
+    return seconds * 1000000000LL + (remainder * 1000000000LL) / frequency.QuadPart;
+}
+
 static XrResult XRAPI_PTR xrCreateActionSet_runtime(XrInstance, const XrActionSetCreateInfo* info, XrActionSet* set) {
     if (!info || !set) return XR_ERROR_VALIDATION_FAILURE;
     static uintptr_t nextSet = 300;
@@ -7634,64 +7881,146 @@ static XrResult XRAPI_PTR xrCreateActionSet_runtime(XrInstance, const XrActionSe
     char setName[XR_MAX_ACTION_SET_NAME_SIZE + 1] = {0};
     memcpy(setName, info->actionSetName, XR_MAX_ACTION_SET_NAME_SIZE);
     Logf("[SimXR] xrCreateActionSet: name=%s", setName);
+    rt::g_actionSets.emplace(*set, rt::ActionSetRecord{info->priority});
     return XR_SUCCESS;
 }
 
 static XrResult XRAPI_PTR xrDestroyActionSet_runtime(XrActionSet set) {
     Log("[SimXR] xrDestroyActionSet");
+    if (!rt::g_actionSets.erase(set)) return XR_ERROR_HANDLE_INVALID;
+    rt::g_attachedActionSets.erase(set);
+    rt::g_activeActionSetHands.erase(set);
+    for (auto it = rt::g_actions.begin(); it != rt::g_actions.end();) {
+        if (it->second.actionSet == set) it = rt::g_actions.erase(it);
+        else ++it;
+    }
     return XR_SUCCESS;
 }
 
-static XrResult XRAPI_PTR xrCreateAction_runtime(XrActionSet, const XrActionCreateInfo* info, XrAction* action) {
+static XrResult XRAPI_PTR xrCreateAction_runtime(XrActionSet actionSet, const XrActionCreateInfo* info, XrAction* action) {
     if (!info || !action) return XR_ERROR_VALIDATION_FAILURE;
-    static uintptr_t nextAction = 400;
-    *action = (XrAction)(nextAction++);
+    auto setIt = rt::g_actionSets.find(actionSet);
+    if (setIt == rt::g_actionSets.end()) return XR_ERROR_HANDLE_INVALID;
+    if (setIt->second.everAttached) return XR_ERROR_ACTIONSETS_ALREADY_ATTACHED;
+    if (info->countSubactionPaths && !info->subactionPaths) return XR_ERROR_VALIDATION_FAILURE;
     // actionName may not be null-terminated
     char actName[XR_MAX_ACTION_NAME_SIZE + 1] = {0};
     memcpy(actName, info->actionName, XR_MAX_ACTION_NAME_SIZE);
     Logf("[SimXR] xrCreateAction: name=%s, type=%d", actName, info->actionType);
 
-    // Store action name for input mapping
-    rt::g_actionNames[*action] = actName;
-
-    // Detect which hand this action is bound to based on subactionPaths
-    int handBinding = 0;  // 0=both/any
-    if (info->countSubactionPaths > 0 && info->subactionPaths) {
+    int handBinding = info->countSubactionPaths == 0 ? 3 : 0;
+    std::unordered_set<XrPath> declaredPaths;
+    if (info->countSubactionPaths > 0) {
         for (uint32_t i = 0; i < info->countSubactionPaths; i++) {
-            auto it = rt::g_pathStrings.find(info->subactionPaths[i]);
-            if (it != rt::g_pathStrings.end()) {
-                if (it->second.find("left") != std::string::npos) handBinding |= 1;
-                if (it->second.find("right") != std::string::npos) handBinding |= 2;
-            }
+            const XrPath path = info->subactionPaths[i];
+            if (!rt::g_pathStrings.count(path)) return XR_ERROR_PATH_INVALID;
+            const int pathHand = HandMaskForTopLevelPath(path);
+            if (!pathHand || !declaredPaths.insert(path).second) return XR_ERROR_PATH_UNSUPPORTED;
+            handBinding |= pathHand;
         }
     }
-    rt::g_actionHand[*action] = handBinding;
+    static uintptr_t nextAction = 400;
+    *action = (XrAction)(nextAction++);
+    rt::ActionRecord record;
+    record.actionSet = actionSet;
+    record.type = info->actionType;
+    record.name = actName;
+    record.declaredHandMask = handBinding;
+    record.declaredSubactionPaths = declaredPaths;
+    rt::g_actions.emplace(*action, std::move(record));
+    setIt->second.declaredSubactionPaths.insert(declaredPaths.begin(), declaredPaths.end());
 
     return XR_SUCCESS;
 }
 
 static XrResult XRAPI_PTR xrDestroyAction_runtime(XrAction action) {
     Log("[SimXR] xrDestroyAction");
-    return XR_SUCCESS;
-}
-
-static XrResult XRAPI_PTR xrSuggestInteractionProfileBindings_runtime(XrInstance, const XrInteractionProfileSuggestedBinding* bindings) {
-    if (!bindings) return XR_ERROR_VALIDATION_FAILURE;
-    // interactionProfile is an XrPath (integer), not a C-string
-    Logf("[SimXR] xrSuggestInteractionProfileBindings: profile=0x%llx",
-         (unsigned long long)bindings->interactionProfile);
-    if (bindings->interactionProfile != XR_NULL_PATH) {
-        auto& list = rt::g_suggestedProfiles;
-        if (std::find(list.begin(), list.end(), bindings->interactionProfile) == list.end()) {
-            list.push_back(bindings->interactionProfile);
+    auto actionIt = rt::g_actions.find(action);
+    if (actionIt == rt::g_actions.end()) return XR_ERROR_HANDLE_INVALID;
+    const XrActionSet actionSet = actionIt->second.actionSet;
+    rt::g_actions.erase(actionIt);
+    auto setIt = rt::g_actionSets.find(actionSet);
+    if (setIt != rt::g_actionSets.end()) {
+        setIt->second.declaredSubactionPaths.clear();
+        for (const auto& entry : rt::g_actions) {
+            if (entry.second.actionSet == actionSet) {
+                setIt->second.declaredSubactionPaths.insert(entry.second.declaredSubactionPaths.begin(),
+                                                            entry.second.declaredSubactionPaths.end());
+            }
         }
     }
     return XR_SUCCESS;
 }
 
-static XrResult XRAPI_PTR xrAttachSessionActionSets_runtime(XrSession, const XrSessionActionSetsAttachInfo* info) {
-    if (!info) return XR_ERROR_VALIDATION_FAILURE;
+static XrResult XRAPI_PTR xrSuggestInteractionProfileBindings_runtime(XrInstance instance, const XrInteractionProfileSuggestedBinding* bindings) {
+    if (!bindings) return XR_ERROR_VALIDATION_FAILURE;
+    if (instance != rt::g_instance.handle) return XR_ERROR_HANDLE_INVALID;
+    if (bindings->countSuggestedBindings && !bindings->suggestedBindings) return XR_ERROR_VALIDATION_FAILURE;
+    // interactionProfile is an XrPath (integer), not a C-string
+    Logf("[SimXR] xrSuggestInteractionProfileBindings: profile=0x%llx",
+         (unsigned long long)bindings->interactionProfile);
+    auto profileIt = rt::g_pathStrings.find(bindings->interactionProfile);
+    if (profileIt == rt::g_pathStrings.end()) return XR_ERROR_PATH_INVALID;
+    if (!IsSupportedInteractionProfilePath(profileIt->second)) return XR_ERROR_PATH_UNSUPPORTED;
+
+    struct PendingBinding { XrAction action; rt::ActionBinding binding; };
+    std::vector<PendingBinding> pending;
+    for (uint32_t i = 0; i < bindings->countSuggestedBindings; ++i) {
+        const XrActionSuggestedBinding& suggested = bindings->suggestedBindings[i];
+        auto actionIt = rt::g_actions.find(suggested.action);
+        if (actionIt == rt::g_actions.end()) return XR_ERROR_HANDLE_INVALID;
+        auto setIt = rt::g_actionSets.find(actionIt->second.actionSet);
+        if (setIt != rt::g_actionSets.end() && setIt->second.everAttached) {
+            return XR_ERROR_ACTIONSETS_ALREADY_ATTACHED;
+        }
+        auto pathIt = rt::g_pathStrings.find(suggested.binding);
+        if (pathIt == rt::g_pathStrings.end()) return XR_ERROR_PATH_INVALID;
+        if (!IsAllowedBindingPath(profileIt->second, pathIt->second)) return XR_ERROR_PATH_UNSUPPORTED;
+        const int handMask = HandMaskForBindingPath(pathIt->second);
+        const rt::ActionInput inputKind = InputForBindingPath(actionIt->second.type, pathIt->second);
+        if (handMask && inputKind != rt::ActionInput::Unknown) {
+            pending.push_back({suggested.action,
+                               {bindings->interactionProfile, suggested.binding,
+                                input::BindingCollisionKey(pathIt->second), handMask, inputKind}});
+        }
+    }
+
+    // A second successful suggestion for the same profile atomically replaces
+    // the first one. Validation above deliberately performs no mutation.
+    for (auto& action : rt::g_actions) {
+        auto& actionBindings = action.second.bindings;
+        actionBindings.erase(std::remove_if(actionBindings.begin(), actionBindings.end(), [&](const rt::ActionBinding& b) {
+            return b.profile == bindings->interactionProfile;
+        }), actionBindings.end());
+    }
+    for (const PendingBinding& item : pending) {
+        rt::g_actions.at(item.action).bindings.push_back(item.binding);
+    }
+    auto& list = rt::g_suggestedProfiles;
+    if (std::find(list.begin(), list.end(), bindings->interactionProfile) == list.end()) {
+        list.push_back(bindings->interactionProfile);
+    }
+    return XR_SUCCESS;
+}
+
+static XrResult XRAPI_PTR xrAttachSessionActionSets_runtime(XrSession session, const XrSessionActionSetsAttachInfo* info) {
+    if (!info || info->type != XR_TYPE_SESSION_ACTION_SETS_ATTACH_INFO || info->countActionSets == 0) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+    if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
+    if (rt::g_sessionActionSetsAttached) return XR_ERROR_ACTIONSETS_ALREADY_ATTACHED;
+    if (info->countActionSets && !info->actionSets) return XR_ERROR_VALIDATION_FAILURE;
+    for (uint32_t i = 0; i < info->countActionSets; ++i) {
+        if (!rt::g_actionSets.count(info->actionSets[i])) return XR_ERROR_HANDLE_INVALID;
+    }
     Logf("[SimXR] xrAttachSessionActionSets: count=%u", info->countActionSets);
+
+    rt::g_attachedActionSets.clear();
+    for (uint32_t i = 0; i < info->countActionSets; ++i) {
+        rt::g_attachedActionSets.insert(info->actionSets[i]);
+        rt::g_actionSets.at(info->actionSets[i]).everAttached = true;
+    }
+    rt::g_sessionActionSetsAttached = true;
 
     // The synthetic controllers behave like Touch, so prefer that profile.
     for (XrPath p : rt::g_suggestedProfiles) {
@@ -7718,131 +8047,238 @@ static XrResult XRAPI_PTR xrAttachSessionActionSets_runtime(XrSession, const XrS
     return XR_SUCCESS;
 }
 
-// Helper to get controller state based on action and subactionPath
-static rt::ControllerState* GetControllerForAction(XrAction action, XrPath subactionPath) {
-    // First check subactionPath
-    if (subactionPath != XR_NULL_PATH) {
-        auto pathIt = rt::g_pathStrings.find(subactionPath);
-        if (pathIt != rt::g_pathStrings.end()) {
-            if (pathIt->second.find("left") != std::string::npos) return &rt::g_leftController;
-            if (pathIt->second.find("right") != std::string::npos) return &rt::g_rightController;
-        }
-    }
-    // Fall back to action's hand binding
-    auto handIt = rt::g_actionHand.find(action);
-    if (handIt != rt::g_actionHand.end()) {
-        if (handIt->second == 1) return &rt::g_leftController;
-        if (handIt->second == 2) return &rt::g_rightController;
-    }
-    // Default to right hand
-    return &rt::g_rightController;
+static const rt::ControllerState& ControllerForHand(int handMask) {
+    return handMask == 1 ? rt::g_leftController : rt::g_rightController;
 }
 
-// Helper to check if action name matches input type (case-insensitive substring match)
-static bool ActionNameMatches(const std::string& name, const char* pattern) {
-    std::string lower = name;
-    for (auto& c : lower) c = (char)tolower(c);
-    std::string patLower = pattern;
-    for (auto& c : patLower) c = (char)tolower(c);
-    return lower.find(patLower) != std::string::npos;
+static bool ReadBooleanInput(rt::ActionInput input, const rt::ControllerState& controller) {
+    switch (input) {
+        case rt::ActionInput::Trigger: return controller.triggerPressed;
+        case rt::ActionInput::Grip: return controller.gripPressed;
+        case rt::ActionInput::Menu: return controller.menuPressed;
+        case rt::ActionInput::Primary: return controller.primaryPressed;
+        case rt::ActionInput::Secondary: return controller.secondaryPressed;
+        case rt::ActionInput::Thumbstick: return controller.thumbstickPressed;
+        default: return false;
+    }
 }
 
-static XrResult XRAPI_PTR xrGetActionStateBoolean_runtime(XrSession, const XrActionStateGetInfo* info, XrActionStateBoolean* state) {
-    if (!info || !state) return XR_ERROR_VALIDATION_FAILURE;
-    state->type = XR_TYPE_ACTION_STATE_BOOLEAN;
-    state->changedSinceLastSync = XR_FALSE;
-    state->lastChangeTime = 0;
+static float ReadFloatInput(rt::ActionInput input, const rt::ControllerState& controller) {
+    if (input == rt::ActionInput::Trigger) return controller.triggerValue;
+    if (input == rt::ActionInput::Grip) return controller.gripValue;
+    return 0.0f;
+}
 
-    // Get controller for this action
-    rt::ControllerState* ctrl = GetControllerForAction(info->action, info->subactionPath);
+static void SyncActionSlot(rt::ActionRecord& action, int slot, int requestedHands, int activeHands,
+                           uint32_t actionSetPriority,
+                           const input::BindingPriorities& sourcePriorities,
+                           XrTime syncTime) {
+    const int eligibleHands = requestedHands & activeHands & action.declaredHandMask;
+    bool active = false;
+    bool booleanValue = false;
+    float scalarValue = 0.0f;
+    XrVector2f vectorValue{0.0f, 0.0f};
+    float vectorMagnitude = -1.0f;
 
-    // Get action name to determine input type
-    bool buttonState = false;
-    auto nameIt = rt::g_actionNames.find(info->action);
-    if (nameIt != rt::g_actionNames.end()) {
-        const std::string& name = nameIt->second;
-        if (ActionNameMatches(name, "trigger") || ActionNameMatches(name, "select") || ActionNameMatches(name, "fire")) {
-            buttonState = ctrl->triggerPressed;
-        } else if (ActionNameMatches(name, "grip") || ActionNameMatches(name, "squeeze") || ActionNameMatches(name, "grab")) {
-            buttonState = ctrl->gripPressed;
-        } else if (ActionNameMatches(name, "menu")) {
-            buttonState = ctrl->menuPressed;
-        } else if (ActionNameMatches(name, "primary") || ActionNameMatches(name, "a_button") || ActionNameMatches(name, "x_button")) {
-            buttonState = ctrl->primaryPressed;
-        } else if (ActionNameMatches(name, "secondary") || ActionNameMatches(name, "b_button") || ActionNameMatches(name, "y_button")) {
-            buttonState = ctrl->secondaryPressed;
-        } else if (ActionNameMatches(name, "thumbstick") || ActionNameMatches(name, "joystick")) {
-            buttonState = ctrl->thumbstickPressed;
+    for (const rt::ActionBinding& binding : action.bindings) {
+        if (binding.profile != rt::g_activeProfile || !(binding.handMask & eligibleHands)) continue;
+        if (!sourcePriorities.Allows(binding.collisionKey, actionSetPriority)) continue;
+        const rt::ControllerState& controller = ControllerForHand(binding.handMask);
+        if (!controller.isTracking) continue;
+        switch (action.type) {
+            case XR_ACTION_TYPE_BOOLEAN_INPUT:
+                active = true;
+                booleanValue = booleanValue || ReadBooleanInput(binding.input, controller);
+                break;
+            case XR_ACTION_TYPE_FLOAT_INPUT: {
+                active = true;
+                const float value = ReadFloatInput(binding.input, controller);
+                if (std::fabs(value) > std::fabs(scalarValue)) scalarValue = value;
+                break;
+            }
+            case XR_ACTION_TYPE_VECTOR2F_INPUT: {
+                if (binding.input != rt::ActionInput::Thumbstick) break;
+                active = true;
+                const float magnitude = controller.thumbstick.x * controller.thumbstick.x +
+                                        controller.thumbstick.y * controller.thumbstick.y;
+                if (magnitude > vectorMagnitude) {
+                    vectorMagnitude = magnitude;
+                    vectorValue = controller.thumbstick;
+                }
+                break;
+            }
+            case XR_ACTION_TYPE_POSE_INPUT:
+                if (binding.input == rt::ActionInput::Pose) active = true;
+                break;
+            default: break;
         }
     }
 
-    state->currentState = buttonState ? XR_TRUE : XR_FALSE;
-    state->isActive = XR_TRUE;  // Controllers are always active in simulator
+    input::ActionSlot& state = action.slots[slot];
+    switch (action.type) {
+        case XR_ACTION_TYPE_BOOLEAN_INPUT:
+            state.boolean.Sync(booleanValue ? XR_TRUE : XR_FALSE, active, syncTime);
+            break;
+        case XR_ACTION_TYPE_FLOAT_INPUT:
+            state.scalar.Sync(scalarValue, active, syncTime);
+            break;
+        case XR_ACTION_TYPE_VECTOR2F_INPUT:
+            state.vector.Sync(vectorValue, active, syncTime);
+            break;
+        case XR_ACTION_TYPE_POSE_INPUT:
+            state.poseActive = active ? XR_TRUE : XR_FALSE;
+            break;
+        default:
+            state.SetInactive(syncTime);
+            break;
+    }
+}
+
+static void LatchActions(XrTime syncTime) {
+    input::BindingPriorities sourcePriorities;
+    for (const auto& entry : rt::g_actions) {
+        const rt::ActionRecord& action = entry.second;
+        auto activeIt = rt::g_activeActionSetHands.find(action.actionSet);
+        if (activeIt == rt::g_activeActionSetHands.end()) continue;
+        auto setIt = rt::g_actionSets.find(action.actionSet);
+        if (setIt == rt::g_actionSets.end()) continue;
+        const int eligibleHands = activeIt->second & action.declaredHandMask;
+        for (const rt::ActionBinding& binding : action.bindings) {
+            if (binding.profile != rt::g_activeProfile || !(binding.handMask & eligibleHands)) continue;
+            sourcePriorities.Observe(binding.collisionKey, setIt->second.priority);
+        }
+    }
+
+    for (auto& entry : rt::g_actions) {
+        rt::ActionRecord& action = entry.second;
+        auto activeIt = rt::g_activeActionSetHands.find(action.actionSet);
+        const int activeHands = activeIt == rt::g_activeActionSetHands.end() ? 0 : activeIt->second;
+        auto setIt = rt::g_actionSets.find(action.actionSet);
+        const uint32_t priority = setIt == rt::g_actionSets.end() ? 0 : setIt->second.priority;
+        SyncActionSlot(action, 0, 3, activeHands, priority, sourcePriorities, syncTime);
+        SyncActionSlot(action, 1, 1, activeHands, priority, sourcePriorities, syncTime);
+        SyncActionSlot(action, 2, 2, activeHands, priority, sourcePriorities, syncTime);
+    }
+}
+
+static XrResult FindActionSlot(const XrActionStateGetInfo* info, XrActionType expectedType,
+                               const input::ActionSlot** slot) {
+    if (!info || !slot || info->type != XR_TYPE_ACTION_STATE_GET_INFO) return XR_ERROR_VALIDATION_FAILURE;
+    auto actionIt = rt::g_actions.find(info->action);
+    if (actionIt == rt::g_actions.end()) return XR_ERROR_HANDLE_INVALID;
+    if (actionIt->second.type != expectedType) return XR_ERROR_ACTION_TYPE_MISMATCH;
+    if (!rt::g_attachedActionSets.count(actionIt->second.actionSet)) return XR_ERROR_ACTIONSET_NOT_ATTACHED;
+
+    int slotIndex = 0;
+    if (info->subactionPath != XR_NULL_PATH) {
+        if (!rt::g_pathStrings.count(info->subactionPath)) return XR_ERROR_PATH_INVALID;
+        const int handMask = HandMaskForTopLevelPath(info->subactionPath);
+        if (!handMask || !actionIt->second.declaredSubactionPaths.count(info->subactionPath)) {
+            return XR_ERROR_PATH_UNSUPPORTED;
+        }
+        slotIndex = handMask;
+    }
+    *slot = &actionIt->second.slots[slotIndex];
     return XR_SUCCESS;
 }
 
-static XrResult XRAPI_PTR xrGetActionStateFloat_runtime(XrSession, const XrActionStateGetInfo* info, XrActionStateFloat* state) {
-    if (!info || !state) return XR_ERROR_VALIDATION_FAILURE;
-    state->type = XR_TYPE_ACTION_STATE_FLOAT;
-    state->changedSinceLastSync = XR_FALSE;
-    state->lastChangeTime = 0;
-
-    // Get controller for this action
-    rt::ControllerState* ctrl = GetControllerForAction(info->action, info->subactionPath);
-
-    // Get action name to determine input type
-    float floatState = 0.0f;
-    auto nameIt = rt::g_actionNames.find(info->action);
-    if (nameIt != rt::g_actionNames.end()) {
-        const std::string& name = nameIt->second;
-        if (ActionNameMatches(name, "trigger") || ActionNameMatches(name, "select") || ActionNameMatches(name, "fire")) {
-            floatState = ctrl->triggerValue;
-        } else if (ActionNameMatches(name, "grip") || ActionNameMatches(name, "squeeze") || ActionNameMatches(name, "grab")) {
-            floatState = ctrl->gripValue;
-        }
-    }
-
-    state->currentState = floatState;
-    state->isActive = XR_TRUE;
-    return XR_SUCCESS;
-}
-
-static XrResult XRAPI_PTR xrGetActionStatePose_runtime(XrSession, const XrActionStateGetInfo* info, XrActionStatePose* state) {
-    if (!info || !state) return XR_ERROR_VALIDATION_FAILURE;
-    state->type = XR_TYPE_ACTION_STATE_POSE;
-    state->isActive = XR_TRUE;
-    return XR_SUCCESS;
-}
-
-static XrResult XRAPI_PTR xrGetActionStateVector2f_runtime(XrSession, const XrActionStateGetInfo* info, XrActionStateVector2f* state) {
-    if (!info || !state) return XR_ERROR_VALIDATION_FAILURE;
-    state->type = XR_TYPE_ACTION_STATE_VECTOR2F;
-    state->changedSinceLastSync = XR_FALSE;
-    state->lastChangeTime = 0;
-
-    // Get controller for this action
-    rt::ControllerState* ctrl = GetControllerForAction(info->action, info->subactionPath);
-
-    // Get action name to determine input type
-    auto nameIt = rt::g_actionNames.find(info->action);
-    if (nameIt != rt::g_actionNames.end()) {
-        const std::string& name = nameIt->second;
-        if (ActionNameMatches(name, "thumbstick") || ActionNameMatches(name, "joystick") ||
-            ActionNameMatches(name, "move") || ActionNameMatches(name, "turn")) {
-            state->currentState = ctrl->thumbstick;
-        } else {
-            state->currentState = {0.0f, 0.0f};
-        }
+static XrResult XRAPI_PTR xrGetActionStateBoolean_runtime(XrSession session, const XrActionStateGetInfo* info, XrActionStateBoolean* state) {
+    if (!state || state->type != XR_TYPE_ACTION_STATE_BOOLEAN) return XR_ERROR_VALIDATION_FAILURE;
+    if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
+    const input::ActionSlot* slot = nullptr;
+    const XrResult result = FindActionSlot(info, XR_ACTION_TYPE_BOOLEAN_INPUT, &slot);
+    if (XR_FAILED(result)) return result;
+    if (rt::g_session.state != XR_SESSION_STATE_FOCUSED) {
+        state->currentState = state->changedSinceLastSync = state->isActive = XR_FALSE;
+        state->lastChangeTime = 0;
     } else {
-        state->currentState = {0.0f, 0.0f};
+        state->currentState = slot->boolean.current;
+        state->changedSinceLastSync = slot->boolean.changed;
+        state->lastChangeTime = slot->boolean.lastChangeTime;
+        state->isActive = slot->boolean.active;
     }
-
-    state->isActive = XR_TRUE;
     return XR_SUCCESS;
 }
 
-static XrResult XRAPI_PTR xrSyncActions_runtime(XrSession, const XrActionsSyncInfo* info) {
-    if (!info) return XR_ERROR_VALIDATION_FAILURE;
+static XrResult XRAPI_PTR xrGetActionStateFloat_runtime(XrSession session, const XrActionStateGetInfo* info, XrActionStateFloat* state) {
+    if (!state || state->type != XR_TYPE_ACTION_STATE_FLOAT) return XR_ERROR_VALIDATION_FAILURE;
+    if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
+    const input::ActionSlot* slot = nullptr;
+    const XrResult result = FindActionSlot(info, XR_ACTION_TYPE_FLOAT_INPUT, &slot);
+    if (XR_FAILED(result)) return result;
+    if (rt::g_session.state != XR_SESSION_STATE_FOCUSED) {
+        state->currentState = 0.0f;
+        state->changedSinceLastSync = state->isActive = XR_FALSE;
+        state->lastChangeTime = 0;
+    } else {
+        state->currentState = slot->scalar.current;
+        state->changedSinceLastSync = slot->scalar.changed;
+        state->lastChangeTime = slot->scalar.lastChangeTime;
+        state->isActive = slot->scalar.active;
+    }
+    return XR_SUCCESS;
+}
+
+static XrResult XRAPI_PTR xrGetActionStatePose_runtime(XrSession session, const XrActionStateGetInfo* info, XrActionStatePose* state) {
+    if (!state || state->type != XR_TYPE_ACTION_STATE_POSE) return XR_ERROR_VALIDATION_FAILURE;
+    if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
+    const input::ActionSlot* slot = nullptr;
+    const XrResult result = FindActionSlot(info, XR_ACTION_TYPE_POSE_INPUT, &slot);
+    if (XR_FAILED(result)) return result;
+    state->isActive = rt::g_session.state == XR_SESSION_STATE_FOCUSED ? slot->poseActive : XR_FALSE;
+    return XR_SUCCESS;
+}
+
+static XrResult XRAPI_PTR xrGetActionStateVector2f_runtime(XrSession session, const XrActionStateGetInfo* info, XrActionStateVector2f* state) {
+    if (!state || state->type != XR_TYPE_ACTION_STATE_VECTOR2F) return XR_ERROR_VALIDATION_FAILURE;
+    if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
+    const input::ActionSlot* slot = nullptr;
+    const XrResult result = FindActionSlot(info, XR_ACTION_TYPE_VECTOR2F_INPUT, &slot);
+    if (XR_FAILED(result)) return result;
+    if (rt::g_session.state != XR_SESSION_STATE_FOCUSED) {
+        state->currentState = {0.0f, 0.0f};
+        state->changedSinceLastSync = state->isActive = XR_FALSE;
+        state->lastChangeTime = 0;
+    } else {
+        state->currentState = slot->vector.current;
+        state->changedSinceLastSync = slot->vector.changed;
+        state->lastChangeTime = slot->vector.lastChangeTime;
+        state->isActive = slot->vector.active;
+    }
+    return XR_SUCCESS;
+}
+
+static XrResult XRAPI_PTR xrSyncActions_runtime(XrSession session, const XrActionsSyncInfo* info) {
+    if (!info || info->type != XR_TYPE_ACTIONS_SYNC_INFO) return XR_ERROR_VALIDATION_FAILURE;
+    if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
+    if (info->countActiveActionSets && !info->activeActionSets) return XR_ERROR_VALIDATION_FAILURE;
+
+    std::unordered_map<XrActionSet, int> requestedActionSets;
+    for (uint32_t i = 0; i < info->countActiveActionSets; ++i) {
+        const XrActiveActionSet& active = info->activeActionSets[i];
+        if (!rt::g_attachedActionSets.count(active.actionSet)) return XR_ERROR_ACTIONSET_NOT_ATTACHED;
+        auto setIt = rt::g_actionSets.find(active.actionSet);
+        if (setIt == rt::g_actionSets.end()) return XR_ERROR_HANDLE_INVALID;
+        int handMask = 3;
+        if (active.subactionPath != XR_NULL_PATH) {
+            if (!rt::g_pathStrings.count(active.subactionPath)) return XR_ERROR_PATH_INVALID;
+            handMask = HandMaskForTopLevelPath(active.subactionPath);
+            if (!handMask || !setIt->second.declaredSubactionPaths.count(active.subactionPath)) {
+                return XR_ERROR_PATH_UNSUPPORTED;
+            }
+        }
+        requestedActionSets[active.actionSet] |= handMask;
+    }
+
+    const XrTime syncTime = CurrentXrTime();
+    if (rt::g_session.state != XR_SESSION_STATE_FOCUSED) {
+        rt::g_activeActionSetHands.clear();
+        LatchActions(syncTime);
+        return XR_SESSION_NOT_FOCUSED;
+    }
+
+    rt::g_activeActionSetHands = std::move(requestedActionSets);
+    LatchActions(syncTime);
     return XR_SUCCESS;
 }
 

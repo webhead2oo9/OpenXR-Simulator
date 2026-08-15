@@ -56,6 +56,10 @@ if(BUILD_TESTING)
         target_compile_options(ui_resolution_tests PRIVATE /utf-8)
     endif()
     add_test(NAME ui_resolution COMMAND ui_resolution_tests)
+
+    add_executable(action_state_tests tests/action_state_tests.cpp)
+    target_include_directories(action_state_tests PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/include)
+    add_test(NAME action_state COMMAND action_state_tests)
 endif()
 
 # Link libraries
