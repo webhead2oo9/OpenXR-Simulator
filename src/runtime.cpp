@@ -119,6 +119,7 @@ static PFNGLCHECKFRAMEBUFFERSTATUSPROC g_glCheckFramebufferStatus = nullptr;
 #include "mcp_integration.h"
 #include "action_state.h"
 #include "composition_validation.h"
+#include "composition_render.h"
 #include "frame_state.h"
 #include "pose_math.h"
 #include "projection_timing.h"
@@ -1222,33 +1223,22 @@ static void ComputeDisplayDims(int& contentW, int& contentH) {
 // clamped to the texture. Apps commonly render a 16:9 eye into a larger or square
 // swapchain and describe it with this rect, so everything downstream - the copy, the
 // preview size, the window aspect - has to work from it and not from the texture.
-// A zero or unusable rect means the whole image, and so does the "show full render" toggle.
-struct SubImageRect { uint32_t x, y, w, h; };
+// The "show full render" diagnostic may expand a non-empty subimage, but a legal empty
+// subimage remains empty and therefore contributes no pixels.
+using SubImageRect = composition_render::SubImageRect;
 static SubImageRect ResolveSubImageRect(const XrRect2Di& rect, uint32_t texW, uint32_t texH,
                                         const char* label) {
-    const SubImageRect full{ 0, 0, texW, texH };
-    if (ui::g_uiState.showFullRender) return full;
-    if (rect.extent.width <= 0 || rect.extent.height <= 0) return full;
-
-    int64_t x = rect.offset.x, y = rect.offset.y;
-    int64_t w = rect.extent.width, h = rect.extent.height;
-    if (x < 0) { w += x; x = 0; }
-    if (y < 0) { h += y; y = 0; }
-    if (x >= (int64_t)texW || y >= (int64_t)texH) {
-        w = h = 0;
-    } else {
-        if (x + w > (int64_t)texW) w = (int64_t)texW - x;
-        if (y + h > (int64_t)texH) h = (int64_t)texH - y;
-    }
-    if (w <= 0 || h <= 0) {
+    const SubImageRect resolved = composition_render::ResolveSubImageRect(
+        rect, texW, texH, ui::g_uiState.showFullRender);
+    if ((rect.extent.width > 0 && rect.extent.height > 0) &&
+        (resolved.w == 0 || resolved.h == 0)) {
         static int badRect = 0;
         if (++badRect % 60 == 1) {
-            Logf("[SimXR] %s: unusable imageRect (offset=%d,%d extent=%dx%d, texture %ux%u); using full image",
+            Logf("[SimXR] %s: unusable imageRect (offset=%d,%d extent=%dx%d, texture %ux%u); skipping",
                  label, rect.offset.x, rect.offset.y, rect.extent.width, rect.extent.height, texW, texH);
         }
-        return full;
     }
-    return SubImageRect{ (uint32_t)x, (uint32_t)y, (uint32_t)w, (uint32_t)h };
+    return resolved;
 }
 
 static perf::ProjectionTimingTracker g_projectionTiming;
@@ -5438,6 +5428,10 @@ static ID3D11Texture2D* acquireTempTexture(rt::Session& s, rt::Session::TempTexE
 static void blitViewToHalf(rt::Session& s, rt::Swapchain& chain, uint32_t srcIndex, uint32_t arraySlice,
                            const XrRect2Di& rect, ID3D11RenderTargetView* rtv,
                            const D3D11_VIEWPORT& vp, ID3D11BlendState* blendState) {
+    // OpenXR permits empty image rectangles. They contribute no pixels; treating one as
+    // an invalid crop and copying the whole texture would expose content the app did not
+    // submit.
+    if (rect.extent.width == 0 || rect.extent.height == 0) return;
     if (!rtv) {
         Log("[SimXR] blitViewToHalf: rtv is null!");
         return;
@@ -6139,6 +6133,9 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
             if (rectR.h > height) height = rectR.h;
         }
     }
+    if ((rectL.w == 0 || rectL.h == 0) && (rectR.w == 0 || rectR.h == 0)) {
+        return;
+    }
     // Publish the source per-eye size so menu/keyboard zoom callbacks can
     // compute a window target without having to walk the swapchain map.
     const UINT prevSourceW = rt::g_sourceWidth.exchange(width);
@@ -6196,7 +6193,7 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
 
             // Get left eye texture
             GLuint leftTex = 0;
-            if (chL.imagesGL.size() > 0) {
+            if (rectL.w > 0 && rectL.h > 0 && chL.imagesGL.size() > 0) {
                 uint32_t idx = chL.lastReleased;
                 if (idx == UINT32_MAX || idx >= chL.imageCount) idx = chL.lastAcquired;
                 if (idx != UINT32_MAX && idx < chL.imagesGL.size()) {
@@ -6206,7 +6203,7 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
 
             // Get right eye texture
             GLuint rightTex = 0;
-            if (chRPtr && chRPtr->imagesGL.size() > 0) {
+            if (rectR.w > 0 && rectR.h > 0 && chRPtr && chRPtr->imagesGL.size() > 0) {
                 uint32_t idx = chRPtr->lastReleased;
                 if (idx == UINT32_MAX || idx >= chRPtr->imageCount) idx = chRPtr->lastAcquired;
                 if (idx != UINT32_MAX && idx < chRPtr->imagesGL.size()) {
@@ -6739,11 +6736,13 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) 
 
     auto& chain = it->second;
 
-    // Get texture dimensions from the quad subImage
-    uint32_t texWidth = quad->subImage.imageRect.extent.width;
-    uint32_t texHeight = quad->subImage.imageRect.extent.height;
-    if (texWidth == 0) texWidth = chain.width;
-    if (texHeight == 0) texHeight = chain.height;
+    // A legal empty rectangle is a no-op. Resolve once so every graphics backend samples
+    // the same region rather than interpreting zero as a request for the full texture.
+    const rt::SubImageRect qrect = rt::ResolveSubImageRect(
+        quad->subImage.imageRect, chain.width, chain.height, "quad");
+    if (qrect.w == 0 || qrect.h == 0) return;
+    const uint32_t texWidth = qrect.w;
+    const uint32_t texHeight = qrect.h;
 
     // Get texture index
     uint32_t texIdx = (chain.lastReleased != UINT32_MAX) ? chain.lastReleased :
@@ -6787,7 +6786,6 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) 
         const int rtWidth = (int)rtDesc.Width, rtHeight = (int)rtDesc.Height;
 
         // Only the region the app declared valid is sampled.
-        const rt::SubImageRect qrect = rt::ResolveSubImageRect(quad->subImage.imageRect, chain.width, chain.height, "quad");
         const float texW = (float)qd.Width, texH = (float)qd.Height;
         if (texW <= 0.0f || texH <= 0.0f) return;
         const float uvRect[4] = { (float)qrect.x / texW, (float)qrect.y / texH,
@@ -7138,8 +7136,7 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) 
         // Clamp the app's rect the way the eye path does, and size the temp texture to the
         // rect rather than the whole image - the copy lands at (0,0), so a full-size temp
         // would leave the sub-rect shrunk into the corner of the sampled UV range.
-        const rt::SubImageRect rect = rt::ResolveSubImageRect(quad->subImage.imageRect,
-                                                              srcDesc.Width, srcDesc.Height, "quad");
+        const rt::SubImageRect rect = qrect;
 
         // One slice at the rect's size, from the cache: a full-size temp would leave
         // the sub-rect shrunk into the corner of the sampled UV range.
