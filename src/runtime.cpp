@@ -118,6 +118,7 @@ static PFNGLCHECKFRAMEBUFFERSTATUSPROC g_glCheckFramebufferStatus = nullptr;
 #include <loader_interfaces.h>
 #include "mcp_integration.h"
 #include "action_state.h"
+#include "interaction_query.h"
 #include "api_validation.h"
 #include "composition_validation.h"
 #include "composition_render.h"
@@ -8547,21 +8548,37 @@ static XrResult XRAPI_PTR xrAttachSessionActionSets_runtime(XrSession session, c
     }
     rt::g_sessionActionSetsAttached = true;
 
-    // The synthetic controllers behave like Touch, so prefer that profile.
+    return XR_SUCCESS;
+}
+
+static XrPath SelectSyntheticInteractionProfile() {
+    // The synthetic devices are two hand controllers. Prefer Touch when the app supplied
+    // it, otherwise emulate the first suggested hand-controller profile. Headset and
+    // gamepad profiles must not become active when this runtime has no such input device.
     for (XrPath p : rt::g_suggestedProfiles) {
         auto it = rt::g_pathStrings.find(p);
         if (it != rt::g_pathStrings.end() && it->second.find("oculus/touch") != std::string::npos) {
-            rt::g_activeProfile = p;
-            break;
+            return p;
         }
     }
-    if (rt::g_activeProfile == XR_NULL_PATH && !rt::g_suggestedProfiles.empty()) {
-        rt::g_activeProfile = rt::g_suggestedProfiles.front();
+    for (XrPath p : rt::g_suggestedProfiles) {
+        auto it = rt::g_pathStrings.find(p);
+        if (it != rt::g_pathStrings.end() && interaction_query::ProfileSupportsTopLevel(
+                it->second, "/user/hand/left")) {
+            return p;
+        }
     }
-    if (rt::g_activeProfile != XR_NULL_PATH) {
-        auto it = rt::g_pathStrings.find(rt::g_activeProfile);
-        Logf("[SimXR] xrAttachSessionActionSets: active interaction profile = %s", it != rt::g_pathStrings.end() ? it->second.c_str() : "<unknown>");
+    return XR_NULL_PATH;
+}
 
+static void UpdateInteractionProfileAtSync() {
+    const XrPath selected = SelectSyntheticInteractionProfile();
+    if (selected == rt::g_activeProfile) return;
+    rt::g_activeProfile = selected;
+    auto it = rt::g_pathStrings.find(selected);
+    Logf("[SimXR] xrSyncActions: active interaction profile = %s",
+         it != rt::g_pathStrings.end() ? it->second.c_str() : "<none>");
+    if (rt::g_session.running) {
         XrEventDataInteractionProfileChanged e{ XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED };
         e.session = rt::g_session.handle;
         XrEventDataBuffer buf{};
@@ -8569,7 +8586,6 @@ static XrResult XRAPI_PTR xrAttachSessionActionSets_runtime(XrSession session, c
         std::memcpy(&buf, &e, sizeof(e));
         rt::g_eventQueue.push_back(buf);
     }
-    return XR_SUCCESS;
 }
 
 static const rt::ControllerState& ControllerForHand(int handMask) {
@@ -8795,6 +8811,11 @@ static XrResult XRAPI_PTR xrSyncActions_runtime(XrSession session, const XrActio
         requestedActionSets[active.actionSet] |= handMask;
     }
 
+    // OpenXR permits interaction-profile selection to change only at this call. Delaying
+    // the initial selection until the running session's first sync also ensures the
+    // corresponding change event is never emitted for a non-running session.
+    if (rt::g_session.running) UpdateInteractionProfileAtSync();
+
     const XrTime syncTime = CurrentXrTime();
     if (rt::g_session.state != XR_SESSION_STATE_FOCUSED) {
         rt::g_activeActionSetHands.clear();
@@ -8837,26 +8858,85 @@ static XrResult XRAPI_PTR xrPathToString_runtime(XrInstance instance, XrPath pat
     return XR_SUCCESS;
 }
 
-static XrResult XRAPI_PTR xrGetCurrentInteractionProfile_runtime(XrSession, XrPath topLevelUserPath, XrInteractionProfileState* interactionProfile) {
-    if (!interactionProfile) return XR_ERROR_VALIDATION_FAILURE;
-    interactionProfile->type = XR_TYPE_INTERACTION_PROFILE_STATE;
-    interactionProfile->interactionProfile = rt::g_activeProfile;
-    return XR_SUCCESS;
-}
-
-static XrResult XRAPI_PTR xrEnumerateBoundSourcesForAction_runtime(XrSession, const XrBoundSourcesForActionEnumerateInfo* info, uint32_t sourceCapacityInput, uint32_t* sourceCountOutput, XrPath* sources) {
-    if (sourceCountOutput) *sourceCountOutput = 0;
-    return XR_SUCCESS;
-}
-
-static XrResult XRAPI_PTR xrGetInputSourceLocalizedName_runtime(XrSession, const XrInputSourceLocalizedNameGetInfo* info, uint32_t bufferCapacityInput, uint32_t* bufferCountOutput, char* buffer) {
-    const char* name = "Unknown";
-    size_t len = strlen(name) + 1;
-    if (bufferCountOutput) *bufferCountOutput = (uint32_t)len;
-    if (buffer && bufferCapacityInput > 0) {
-        strncpy(buffer, name, bufferCapacityInput - 1);
-        buffer[bufferCapacityInput - 1] = '\0';
+static XrResult XRAPI_PTR xrGetCurrentInteractionProfile_runtime(
+    XrSession session, XrPath topLevelUserPath, XrInteractionProfileState* interactionProfile) {
+    if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
+    if (!interactionProfile || interactionProfile->type != XR_TYPE_INTERACTION_PROFILE_STATE) {
+        return XR_ERROR_VALIDATION_FAILURE;
     }
+    if (!rt::g_sessionActionSetsAttached) return XR_ERROR_ACTIONSET_NOT_ATTACHED;
+    auto pathIt = rt::g_pathStrings.find(topLevelUserPath);
+    if (pathIt == rt::g_pathStrings.end()) return XR_ERROR_PATH_INVALID;
+    if (!interaction_query::IsCoreTopLevelUserPath(pathIt->second)) {
+        return XR_ERROR_PATH_UNSUPPORTED;
+    }
+
+    interactionProfile->interactionProfile = XR_NULL_PATH;
+    auto profileIt = rt::g_pathStrings.find(rt::g_activeProfile);
+    if (profileIt != rt::g_pathStrings.end() &&
+        interaction_query::ProfileSupportsTopLevel(profileIt->second, pathIt->second)) {
+        interactionProfile->interactionProfile = rt::g_activeProfile;
+    }
+    return XR_SUCCESS;
+}
+
+static XrResult XRAPI_PTR xrEnumerateBoundSourcesForAction_runtime(
+    XrSession session, const XrBoundSourcesForActionEnumerateInfo* info,
+    uint32_t sourceCapacityInput, uint32_t* sourceCountOutput, XrPath* sources) {
+    if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
+    if (!info || info->type != XR_TYPE_BOUND_SOURCES_FOR_ACTION_ENUMERATE_INFO) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+    auto actionIt = rt::g_actions.find(info->action);
+    if (actionIt == rt::g_actions.end()) return XR_ERROR_HANDLE_INVALID;
+    if (!rt::g_attachedActionSets.count(actionIt->second.actionSet)) {
+        return XR_ERROR_ACTIONSET_NOT_ATTACHED;
+    }
+
+    std::vector<XrPath> boundSources;
+    for (const rt::ActionBinding& binding : actionIt->second.bindings) {
+        if (binding.profile != rt::g_activeProfile ||
+            !(binding.handMask & actionIt->second.declaredHandMask) ||
+            std::find(boundSources.begin(), boundSources.end(), binding.sourcePath) !=
+                boundSources.end()) {
+            continue;
+        }
+        boundSources.push_back(binding.sourcePath);
+    }
+    const XrResult validation = api_validation::ValidateEnumeration(
+        sourceCapacityInput, sourceCountOutput, sources,
+        static_cast<uint32_t>(boundSources.size()));
+    if (XR_FAILED(validation) || sourceCapacityInput == 0) return validation;
+    std::copy(boundSources.begin(), boundSources.end(), sources);
+    return XR_SUCCESS;
+}
+
+static XrResult XRAPI_PTR xrGetInputSourceLocalizedName_runtime(
+    XrSession session, const XrInputSourceLocalizedNameGetInfo* info,
+    uint32_t bufferCapacityInput, uint32_t* bufferCountOutput, char* buffer) {
+    if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
+    if (!info || info->type != XR_TYPE_INPUT_SOURCE_LOCALIZED_NAME_GET_INFO) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+    if (!rt::g_sessionActionSetsAttached) return XR_ERROR_ACTIONSET_NOT_ATTACHED;
+    constexpr XrInputSourceLocalizedNameFlags validFlags =
+        XR_INPUT_SOURCE_LOCALIZED_NAME_USER_PATH_BIT |
+        XR_INPUT_SOURCE_LOCALIZED_NAME_INTERACTION_PROFILE_BIT |
+        XR_INPUT_SOURCE_LOCALIZED_NAME_COMPONENT_BIT;
+    if (info->whichComponents == 0 || (info->whichComponents & ~validFlags) != 0) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+    auto sourceIt = rt::g_pathStrings.find(info->sourcePath);
+    if (sourceIt == rt::g_pathStrings.end()) return XR_ERROR_PATH_INVALID;
+    const auto profileIt = rt::g_pathStrings.find(rt::g_activeProfile);
+    const std::string profile = profileIt == rt::g_pathStrings.end() ? "" : profileIt->second;
+    const std::string name = interaction_query::LocalizedSourceName(
+        sourceIt->second, profile, info->whichComponents);
+    const uint32_t required = static_cast<uint32_t>(name.size() + 1);
+    const XrResult validation = api_validation::ValidateEnumeration(
+        bufferCapacityInput, bufferCountOutput, buffer, required);
+    if (XR_FAILED(validation) || bufferCapacityInput == 0) return validation;
+    std::memcpy(buffer, name.c_str(), required);
     return XR_SUCCESS;
 }
 

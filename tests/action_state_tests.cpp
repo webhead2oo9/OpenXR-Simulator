@@ -1,4 +1,5 @@
 #include "action_state.h"
+#include "interaction_query.h"
 
 #include <cstdio>
 
@@ -71,6 +72,30 @@ int main() {
           "an explicitly allowed leaf remains valid");
     Check(!input::BindingPathAllowed("input/not_a_real_source", touchStickPaths),
           "an unknown parent source remains unsupported");
+
+    Check(interaction_query::IsCoreTopLevelUserPath("/user/treadmill"),
+          "all core top-level user paths are recognized");
+    Check(!interaction_query::IsCoreTopLevelUserPath("/user/hand/left/input/trigger"),
+          "an input component is not a top-level user path");
+    Check(interaction_query::ProfileSupportsTopLevel(
+              "/interaction_profiles/oculus/touch_controller", "/user/hand/right"),
+          "the Touch profile is active on hand paths");
+    Check(!interaction_query::ProfileSupportsTopLevel(
+              "/interaction_profiles/oculus/touch_controller", "/user/gamepad"),
+          "a hand profile is not reported for the gamepad");
+    const XrInputSourceLocalizedNameFlags allNameParts =
+        XR_INPUT_SOURCE_LOCALIZED_NAME_USER_PATH_BIT |
+        XR_INPUT_SOURCE_LOCALIZED_NAME_INTERACTION_PROFILE_BIT |
+        XR_INPUT_SOURCE_LOCALIZED_NAME_COMPONENT_BIT;
+    Check(interaction_query::LocalizedSourceName(
+              "/user/hand/right/input/trigger/value",
+              "/interaction_profiles/oculus/touch_controller", allNameParts) ==
+              "Right Hand Oculus Touch Controller Trigger",
+          "localized source names honor all requested components");
+    Check(interaction_query::LocalizedSourceName(
+              "/user/hand/left/input/grip/pose", "",
+              XR_INPUT_SOURCE_LOCALIZED_NAME_COMPONENT_BIT) == "Grip Pose",
+          "component-only names omit unrequested path and profile text");
 
     if (failures) return 1;
     std::puts("action state tests passed");
