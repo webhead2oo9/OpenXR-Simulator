@@ -102,6 +102,7 @@ static PFNGLCHECKFRAMEBUFFERSTATUSPROC g_glCheckFramebufferStatus = nullptr;
 #include <cstdlib>
 #include <thread>
 #include <mutex>
+#include <condition_variable>
 #include <atomic>
 #include <deque>
 #include <algorithm>
@@ -117,6 +118,7 @@ static PFNGLCHECKFRAMEBUFFERSTATUSPROC g_glCheckFramebufferStatus = nullptr;
 #include <loader_interfaces.h>
 #include "mcp_integration.h"
 #include "action_state.h"
+#include "frame_state.h"
 #include "pose_math.h"
 #include "projection_timing.h"
 #include "swapchain_state.h"
@@ -429,6 +431,11 @@ struct VulkanSession {
 struct Session {
     XrSession handle{(XrSession)1};
     XrSessionState state{XR_SESSION_STATE_IDLE};
+    bool running{false};
+    bool exitRequested{false};
+    frame_state::Lifecycle frameLifecycle;
+    std::mutex frameMutex;
+    std::condition_variable frameCondition;
     ComPtr<ID3D11Device> d3d11Device;
     ComPtr<ID3D11DeviceContext> d3d11Context;
     // DX12 support
@@ -1494,7 +1501,13 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
     switch (msg) {
         case WM_CLOSE:
             if (rt::g_session.handle != XR_NULL_HANDLE) {
-                rt::PushState(rt::g_session.handle, XR_SESSION_STATE_EXITING);
+                bool running = false;
+                {
+                    std::lock_guard<std::mutex> lock(rt::g_session.frameMutex);
+                    running = rt::g_session.running;
+                    if (running) rt::g_session.exitRequested = true;
+                }
+                if (running) rt::PushState(rt::g_session.handle, XR_SESSION_STATE_STOPPING);
             }
             Log("[SimXR] WndProc: WM_CLOSE received");
             DestroyWindow(hWnd);
@@ -3110,6 +3123,13 @@ static XrResult XRAPI_PTR xrCreateSession_runtime(XrInstance instance, const XrS
         rt::g_session.isFocused = false;
     }
     if (rt::g_session.usesVulkan) vkrt::ShutdownSession(rt::g_session);
+    {
+        std::lock_guard<std::mutex> lock(rt::g_session.frameMutex);
+        rt::g_session.running = false;
+        rt::g_session.exitRequested = false;
+        rt::g_session.frameLifecycle.Reset();
+    }
+    rt::g_session.frameCondition.notify_all();
     // Accept D3D11 and D3D12
     const XrBaseInStructure* entry = reinterpret_cast<const XrBaseInStructure*>(info->next);
     while (entry) {
@@ -3214,6 +3234,13 @@ static XrResult XRAPI_PTR xrDestroySession_runtime(XrSession s) {
              (unsigned long long)rt::g_session.handle);
         return XR_ERROR_HANDLE_INVALID;
     }
+    {
+        std::lock_guard<std::mutex> lock(rt::g_session.frameMutex);
+        rt::g_session.running = false;
+        rt::g_session.exitRequested = false;
+        rt::g_session.frameLifecycle.Reset();
+    }
+    rt::g_session.frameCondition.notify_all();
     
     // Transfer window and swapchain to global persistent storage
     // Unity likes to create/destroy sessions rapidly for compatibility checks
@@ -4172,11 +4199,25 @@ static XrResult XRAPI_PTR xrPollEvent_runtime(XrInstance, XrEventDataBuffer* b) 
 // Defined further down, with the rest of the preview plumbing.
 static void ensurePreviewWithoutProjection(rt::Session& s);
 
-static XrResult XRAPI_PTR xrBeginSession_runtime(XrSession s, const XrSessionBeginInfo*) { 
+static XrResult XRAPI_PTR xrBeginSession_runtime(XrSession s, const XrSessionBeginInfo* info) {
     Log("[SimXR] ============================================");
     Logf("[SimXR] xrBeginSession called (session=%llu)", (unsigned long long)s);
     Log("[SimXR] Session started - moving to SYNCHRONIZED/VISIBLE states");
     Log("[SimXR] ============================================");
+
+    if (s != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
+    if (!info || info->type != XR_TYPE_SESSION_BEGIN_INFO) return XR_ERROR_VALIDATION_FAILURE;
+    if (info->primaryViewConfigurationType != XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO) {
+        return XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED;
+    }
+    {
+        std::lock_guard<std::mutex> lock(rt::g_session.frameMutex);
+        if (rt::g_session.running) return XR_ERROR_SESSION_RUNNING;
+        if (rt::g_session.state != XR_SESSION_STATE_READY) return XR_ERROR_SESSION_NOT_READY;
+        rt::g_session.running = true;
+        rt::g_session.exitRequested = false;
+        rt::g_session.frameLifecycle.Reset();
+    }
 
     // Bring the preview up now instead of waiting for the first projection
     // layer. An app that boots into a 2D-only screen submits nothing but quad
@@ -4199,10 +4240,50 @@ static XrResult XRAPI_PTR xrBeginSession_runtime(XrSession s, const XrSessionBeg
     rt::PushState(s, XR_SESSION_STATE_FOCUSED);
     return XR_SUCCESS; 
 }
-static XrResult XRAPI_PTR xrEndSession_runtime(XrSession s) { Log("[SimXR] xrEndSession"); rt::PushState(s, XR_SESSION_STATE_STOPPING); rt::PushState(s, XR_SESSION_STATE_IDLE); return XR_SUCCESS; }
-static XrResult XRAPI_PTR xrRequestExitSession_runtime(XrSession s) { rt::PushState(s, XR_SESSION_STATE_EXITING); return XR_SUCCESS; }
-static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession, const XrFrameWaitInfo*, XrFrameState* s) {
-    if (!s) return XR_ERROR_VALIDATION_FAILURE;
+static XrResult XRAPI_PTR xrEndSession_runtime(XrSession s) {
+    Log("[SimXR] xrEndSession");
+    if (s != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
+    bool exitRequested = false;
+    bool wasStopping = false;
+    {
+        std::lock_guard<std::mutex> lock(rt::g_session.frameMutex);
+        if (!rt::g_session.running) return XR_ERROR_SESSION_NOT_RUNNING;
+        wasStopping = rt::g_session.state == XR_SESSION_STATE_STOPPING;
+        rt::g_session.running = false;
+        exitRequested = rt::g_session.exitRequested;
+        rt::g_session.exitRequested = false;
+        rt::g_session.frameLifecycle.Reset();
+    }
+    rt::g_session.frameCondition.notify_all();
+    if (!wasStopping) return XR_ERROR_SESSION_NOT_STOPPING;
+    rt::PushState(s, XR_SESSION_STATE_IDLE);
+    if (exitRequested) rt::PushState(s, XR_SESSION_STATE_EXITING);
+    return XR_SUCCESS;
+}
+static XrResult XRAPI_PTR xrRequestExitSession_runtime(XrSession s) {
+    if (s != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
+    {
+        std::lock_guard<std::mutex> lock(rt::g_session.frameMutex);
+        if (!rt::g_session.running) return XR_ERROR_SESSION_NOT_RUNNING;
+        rt::g_session.exitRequested = true;
+    }
+    rt::PushState(s, XR_SESSION_STATE_STOPPING);
+    return XR_SUCCESS;
+}
+static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession session, const XrFrameWaitInfo* info, XrFrameState* s) {
+    if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
+    if (!s || s->type != XR_TYPE_FRAME_STATE ||
+        (info && info->type != XR_TYPE_FRAME_WAIT_INFO)) return XR_ERROR_VALIDATION_FAILURE;
+    {
+        std::unique_lock<std::mutex> lock(rt::g_session.frameMutex);
+        if (!rt::g_session.running) return XR_ERROR_SESSION_NOT_RUNNING;
+        rt::g_session.frameCondition.wait(lock, [] {
+            return !rt::g_session.running || rt::g_session.frameLifecycle.CanWait();
+        });
+        if (!rt::g_session.running) return XR_ERROR_SESSION_NOT_RUNNING;
+        const XrResult result = rt::g_session.frameLifecycle.MarkWaited();
+        if (XR_FAILED(result)) return result;
+    }
     // Message pump so the preview window stays responsive
     MSG msg; while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) { TranslateMessage(&msg); DispatchMessageW(&msg); }
     static LARGE_INTEGER freq = [](){ LARGE_INTEGER f; QueryPerformanceFrequency(&f); return f; }();
@@ -4626,10 +4707,21 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession, const XrFrameWaitInfo*,
     }
     // Convert QPC to nanoseconds using double to avoid overflow on MSVC
     XrTime nowTime = (XrTime)((double)now.QuadPart * 1000000000.0 / (double)freq.QuadPart);
-    s->type = XR_TYPE_FRAME_STATE; s->shouldRender = XR_TRUE; s->predictedDisplayPeriod = periodNs; s->predictedDisplayTime = nowTime + periodNs;
+    s->shouldRender = XR_TRUE; s->predictedDisplayPeriod = periodNs; s->predictedDisplayTime = nowTime + periodNs;
     return XR_SUCCESS;
 }
-static XrResult XRAPI_PTR xrBeginFrame_runtime(XrSession, const XrFrameBeginInfo*) { return XR_SUCCESS; }
+static XrResult XRAPI_PTR xrBeginFrame_runtime(XrSession session, const XrFrameBeginInfo* info) {
+    if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
+    if (info && info->type != XR_TYPE_FRAME_BEGIN_INFO) return XR_ERROR_VALIDATION_FAILURE;
+    XrResult result;
+    {
+        std::lock_guard<std::mutex> lock(rt::g_session.frameMutex);
+        if (!rt::g_session.running) return XR_ERROR_SESSION_NOT_RUNNING;
+        result = rt::g_session.frameLifecycle.Begin();
+    }
+    if (XR_SUCCEEDED(result)) rt::g_session.frameCondition.notify_all();
+    return result;
+}
 
 // Ensure the preview window exists (create or adopt the persistent one) and
 // pick a sensible initial outer size if it's brand new. The window size is
@@ -7267,7 +7359,15 @@ static void consumeCompletedPreviewFrame(rt::Session& s) {
     paintPreviewComposite(s, f);
 }
 
-static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* info) {
+static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession session, const XrFrameEndInfo* info) {
+    if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
+    if (!info || info->type != XR_TYPE_FRAME_END_INFO) return XR_ERROR_VALIDATION_FAILURE;
+    {
+        std::lock_guard<std::mutex> lock(rt::g_session.frameMutex);
+        if (!rt::g_session.running) return XR_ERROR_SESSION_NOT_RUNNING;
+        if (!rt::g_session.frameLifecycle.CanEnd()) return XR_ERROR_CALL_ORDER_INVALID;
+    }
+
     // Reentrance guard: when our preview swapchain calls Present(), Steam's overlay
     // (gameoverlayrenderer64) hooks it, which can trigger UEVR to re-submit frames
     // through the OpenXR API layer chain, re-entering this function and causing
@@ -7302,12 +7402,6 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
         if (reason != S_OK) {
             Logf("[SimXR] xrEndFrame: D3D12 DEVICE REMOVED! reason=0x%08X", (unsigned)reason);
         }
-    }
-
-    if (!info) {
-        Log("[SimXR] xrEndFrame: ERROR - info is null");
-        inEndFrame.clear(std::memory_order_release);
-        return XR_ERROR_VALIDATION_FAILURE;
     }
 
     // Drain the requests that decide whether this frame has to reach the mirror, before
@@ -7584,8 +7678,15 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession, const XrFrameEndInfo* in
         }
     }
 
+    XrResult result;
+    {
+        std::lock_guard<std::mutex> lock(rt::g_session.frameMutex);
+        result = rt::g_session.running
+            ? rt::g_session.frameLifecycle.End()
+            : XR_ERROR_SESSION_NOT_RUNNING;
+    }
     inEndFrame.clear(std::memory_order_release);
-    return XR_SUCCESS;
+    return result;
 }
 
 static bool GetSpaceWorldPose(XrSpace space, XrPosef& worldPose, bool& tracked) {
@@ -7689,7 +7790,6 @@ static XrResult XRAPI_PTR xrLocateSpace_runtime(XrSpace space, XrSpace baseSpace
         !GetSpaceWorldPose(baseSpace, baseWorld, baseTracked)) {
         return XR_ERROR_HANDLE_INVALID;
     }
-
     if (!spaceTracked || !baseTracked) {
         location->locationFlags = 0;
         location->pose = pose_math::Identity();

@@ -68,6 +68,10 @@ if(BUILD_TESTING)
     add_executable(swapchain_state_tests tests/swapchain_state_tests.cpp)
     target_include_directories(swapchain_state_tests PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/include)
     add_test(NAME swapchain_state COMMAND swapchain_state_tests)
+
+    add_executable(frame_state_tests tests/frame_state_tests.cpp)
+    target_include_directories(frame_state_tests PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/include)
+    add_test(NAME frame_state COMMAND frame_state_tests)
 endif()
 
 # Link libraries
