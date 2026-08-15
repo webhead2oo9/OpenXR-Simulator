@@ -7,8 +7,10 @@
 namespace api_validation {
 
 inline XrResult ValidateApiVersion(XrVersion requested, XrVersion supported) {
+    // Patch revisions are fully compatible in OpenXR. Compare the interface-bearing
+    // major/minor pair and deliberately ignore patch.
     if (requested == 0 || XR_VERSION_MAJOR(requested) != XR_VERSION_MAJOR(supported) ||
-        requested > supported) {
+        XR_VERSION_MINOR(requested) > XR_VERSION_MINOR(supported)) {
         return XR_ERROR_API_VERSION_UNSUPPORTED;
     }
     return XR_SUCCESS;

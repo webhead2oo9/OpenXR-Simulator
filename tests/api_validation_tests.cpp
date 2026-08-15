@@ -15,9 +15,8 @@ int main() {
     const XrVersion supported = XR_MAKE_VERSION(1, 0, 34);
     Check(api_validation::ValidateApiVersion(XR_MAKE_VERSION(1, 0, 34), supported) == XR_SUCCESS,
           "the advertised API version is accepted");
-    Check(api_validation::ValidateApiVersion(XR_MAKE_VERSION(1, 0, 35), supported) ==
-              XR_ERROR_API_VERSION_UNSUPPORTED,
-          "a newer patch than the runtime advertises is rejected");
+    Check(api_validation::ValidateApiVersion(XR_MAKE_VERSION(1, 0, 35), supported) == XR_SUCCESS,
+          "patch revisions remain fully compatible");
     Check(api_validation::ValidateApiVersion(XR_MAKE_VERSION(1, 1, 0), supported) ==
               XR_ERROR_API_VERSION_UNSUPPORTED,
           "a newer minor version is rejected");

@@ -8986,10 +8986,50 @@ static const NameFn kFnTable[] = {
     {"xrConvertTimeToWin32PerformanceCounterKHR", (PFN_xrVoidFunction)xrConvertTimeToWin32PerformanceCounterKHR_runtime},
 };
 
+static bool IsGlobalCommand(const char* name) {
+    return strcmp(name, "xrEnumerateApiLayerProperties") == 0 ||
+           strcmp(name, "xrEnumerateInstanceExtensionProperties") == 0 ||
+           strcmp(name, "xrCreateInstance") == 0;
+}
+
+static const char* RequiredExtensionForCommand(const char* name) {
+    if (strcmp(name, "xrGetD3D11GraphicsRequirementsKHR") == 0)
+        return XR_KHR_D3D11_ENABLE_EXTENSION_NAME;
+    if (strcmp(name, "xrGetD3D12GraphicsRequirementsKHR") == 0)
+        return XR_KHR_D3D12_ENABLE_EXTENSION_NAME;
+    if (strcmp(name, "xrGetOpenGLGraphicsRequirementsKHR") == 0)
+        return XR_KHR_OPENGL_ENABLE_EXTENSION_NAME;
+    if (strcmp(name, "xrGetVulkanGraphicsRequirementsKHR") == 0 ||
+        strcmp(name, "xrGetVulkanInstanceExtensionsKHR") == 0 ||
+        strcmp(name, "xrGetVulkanDeviceExtensionsKHR") == 0 ||
+        strcmp(name, "xrGetVulkanGraphicsDeviceKHR") == 0)
+        return XR_KHR_VULKAN_ENABLE_EXTENSION_NAME;
+    if (strcmp(name, "xrGetVulkanGraphicsRequirements2KHR") == 0 ||
+        strcmp(name, "xrCreateVulkanInstanceKHR") == 0 ||
+        strcmp(name, "xrCreateVulkanDeviceKHR") == 0 ||
+        strcmp(name, "xrGetVulkanGraphicsDevice2KHR") == 0)
+        return XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME;
+    if (strcmp(name, "xrConvertWin32PerformanceCounterToTimeKHR") == 0 ||
+        strcmp(name, "xrConvertTimeToWin32PerformanceCounterKHR") == 0)
+        return "XR_KHR_win32_convert_performance_counter_time";
+    return nullptr;
+}
+
 static XrResult XRAPI_PTR xrGetInstanceProcAddr_runtime(XrInstance instance, const char* name, PFN_xrVoidFunction* fn) {
     if (!name || !fn) {
         Logf("[SimXR] xrGetInstanceProcAddr: ERROR - name=%p, fn=%p", name, fn);
         return XR_ERROR_VALIDATION_FAILURE;
+    }
+    *fn = nullptr;
+    if (instance == XR_NULL_HANDLE) {
+        if (!IsGlobalCommand(name)) return XR_ERROR_HANDLE_INVALID;
+    } else if (!IsValidInstance(instance)) {
+        return XR_ERROR_HANDLE_INVALID;
+    }
+    if (const char* extension = RequiredExtensionForCommand(name)) {
+        if (instance == XR_NULL_HANDLE || !IsExtensionEnabled(extension)) {
+            return XR_ERROR_FUNCTION_UNSUPPORTED;
+        }
     }
     
     // Reduce logging verbosity for xrGetInstanceProcAddr
