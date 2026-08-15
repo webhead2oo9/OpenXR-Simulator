@@ -345,7 +345,7 @@ static std::atomic<UINT> g_sourceWidth{0};
 static std::atomic<UINT> g_sourceHeight{0};
 
 struct Instance {
-    XrInstance handle{(XrInstance)1};
+    XrInstance handle{XR_NULL_HANDLE};
     std::vector<std::string> enabledExtensions;
 };
 
@@ -432,7 +432,7 @@ struct VulkanSession {
 };
 
 struct Session {
-    XrSession handle{(XrSession)1};
+    XrSession handle{XR_NULL_HANDLE};
     XrSessionState state{XR_SESSION_STATE_IDLE};
     bool running{false};
     bool exitRequested{false};
@@ -2555,6 +2555,8 @@ static void FrameSyncEnd(rt::Session& s) {
 
 // ----------------- OpenXR runtime exports -----------------
 
+static constexpr XrVersion kRuntimeApiVersion = XR_MAKE_VERSION(1, 0, 34);
+
 static XrResult XRAPI_PTR xrGetInstanceProcAddr_runtime(XrInstance, const char* name, PFN_xrVoidFunction* fn);
 
 extern "C" __declspec(dllexport) XrResult XRAPI_CALL xrNegotiateLoaderRuntimeInterface(const XrNegotiateLoaderInfo* loaderInfo,
@@ -2585,7 +2587,7 @@ extern "C" __declspec(dllexport) XrResult XRAPI_CALL xrNegotiateLoaderRuntimeInt
         
         runtimeRequest->runtimeInterfaceVersion = XR_CURRENT_LOADER_RUNTIME_VERSION;
         runtimeRequest->getInstanceProcAddr = xrGetInstanceProcAddr_runtime;
-        runtimeRequest->runtimeApiVersion = XR_CURRENT_API_VERSION;
+        runtimeRequest->runtimeApiVersion = kRuntimeApiVersion;
         
         Logf("[SimXR] xrNegotiateLoaderRuntimeInterface: SUCCESS - runtimeApiVersion=0x%X (%u)", 
              runtimeRequest->runtimeApiVersion, runtimeRequest->runtimeApiVersion);
@@ -2916,16 +2918,28 @@ static XrResult XRAPI_PTR xrEnumerateInstanceExtensionProperties_runtime(const c
     return XR_SUCCESS;
 }
 
+static XrResult XRAPI_PTR xrDestroySession_runtime(XrSession session);
+
 static XrResult XRAPI_PTR xrCreateInstance_runtime(const XrInstanceCreateInfo* createInfo, XrInstance* instance) {
-    if (!createInfo || !instance) return XR_ERROR_VALIDATION_FAILURE;
-    // applicationName may not be null-terminated
+    if (!createInfo || !instance || createInfo->type != XR_TYPE_INSTANCE_CREATE_INFO ||
+        createInfo->createFlags != 0) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+    if (rt::g_instance.handle != XR_NULL_HANDLE) return XR_ERROR_LIMIT_REACHED;
+    const XrResult versionValidation = api_validation::ValidateApiVersion(
+        createInfo->applicationInfo.apiVersion, kRuntimeApiVersion);
+    if (XR_FAILED(versionValidation)) return versionValidation;
+    if ((createInfo->enabledApiLayerCount && !createInfo->enabledApiLayerNames) ||
+        (createInfo->enabledExtensionCount && !createInfo->enabledExtensionNames)) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+    if (createInfo->enabledApiLayerCount != 0) return XR_ERROR_API_LAYER_NOT_PRESENT;
+
     char appName[XR_MAX_APPLICATION_NAME_SIZE + 1] = {0};
     memcpy(appName, createInfo->applicationInfo.applicationName, XR_MAX_APPLICATION_NAME_SIZE);
     Logf("[SimXR] xrCreateInstance: app=%s version=%u", 
          appName,
          createInfo->applicationInfo.applicationVersion);
-    rt::g_instance = {};
-    rt::g_instance.enabledExtensions.clear();
 
     // Restore the saved UI settings here rather than at window creation: apps ask
     // for view configurations, whose panel resolution and FOV both come from the
@@ -2945,22 +2959,33 @@ static XrResult XRAPI_PTR xrCreateInstance_runtime(const XrInstanceCreateInfo* c
 
     // Validate that all requested extensions are supported
     const uint32_t supportedCount = (uint32_t)(sizeof(kSupportedExtensions)/sizeof(kSupportedExtensions[0]));
+    std::vector<std::string> enabledExtensions;
+    enabledExtensions.reserve(createInfo->enabledExtensionCount);
     for (uint32_t i = 0; i < createInfo->enabledExtensionCount; ++i) {
+        const char* requested = createInfo->enabledExtensionNames[i];
+        if (!requested || strnlen(requested, XR_MAX_EXTENSION_NAME_SIZE) == XR_MAX_EXTENSION_NAME_SIZE) {
+            return XR_ERROR_VALIDATION_FAILURE;
+        }
         bool supported = false;
         for (uint32_t j = 0; j < supportedCount; ++j) {
-            if (strcmp(createInfo->enabledExtensionNames[i], kSupportedExtensions[j]) == 0) {
+            if (strcmp(requested, kSupportedExtensions[j]) == 0) {
                 supported = true;
                 break;
             }
         }
         if (!supported) {
-            Logf("[SimXR] xrCreateInstance: ERROR - Unsupported extension %s", createInfo->enabledExtensionNames[i]);
+            Logf("[SimXR] xrCreateInstance: ERROR - Unsupported extension %s", requested);
             return XR_ERROR_EXTENSION_NOT_PRESENT;
         }
-        rt::g_instance.enabledExtensions.emplace_back(createInfo->enabledExtensionNames[i]);
-        Logf("[SimXR]   enabledExt[%u]=%s", i, createInfo->enabledExtensionNames[i]);
+        if (std::find(enabledExtensions.begin(), enabledExtensions.end(), requested) !=
+            enabledExtensions.end()) {
+            return XR_ERROR_VALIDATION_FAILURE;
+        }
+        enabledExtensions.emplace_back(requested);
+        Logf("[SimXR]   enabledExt[%u]=%s", i, requested);
     }
-    rt::g_instance.handle = (XrInstance)1;  // Set a valid handle
+    rt::g_instance.enabledExtensions = std::move(enabledExtensions);
+    rt::g_instance.handle = (XrInstance)1;
     *instance = rt::g_instance.handle;
     Log("[SimXR] xrCreateInstance: SUCCESS");
     return XR_SUCCESS;
@@ -2969,9 +2994,16 @@ static XrResult XRAPI_PTR xrCreateInstance_runtime(const XrInstanceCreateInfo* c
 static XrResult XRAPI_PTR xrDestroyInstance_runtime(XrInstance instance) {
     Logf("[SimXR] xrDestroyInstance called: instance=%p", instance);
 
+    if (instance == XR_NULL_HANDLE || instance != rt::g_instance.handle) {
+        return XR_ERROR_HANDLE_INVALID;
+    }
+
     // Clear the global instance
-    if (instance == rt::g_instance.handle) {
+    {
         Log("[SimXR] xrDestroyInstance: Clearing global instance");
+        if (rt::g_session.handle != XR_NULL_HANDLE) {
+            xrDestroySession_runtime(rt::g_session.handle);
+        }
         rt::g_instance = {};
         rt::g_actionSets.clear();
         rt::g_attachedActionSets.clear();
@@ -3016,7 +3048,7 @@ static XrResult XRAPI_PTR xrGetInstanceProperties_runtime(XrInstance, XrInstance
     if (!props) return XR_ERROR_VALIDATION_FAILURE;
     props->type = XR_TYPE_INSTANCE_PROPERTIES;
     props->next = nullptr;
-    props->runtimeVersion = XR_MAKE_VERSION(1, 0, 27);
+    props->runtimeVersion = kRuntimeApiVersion;
     strncpy(props->runtimeName, "OpenXR Simulator Runtime", XR_MAX_RUNTIME_NAME_SIZE - 1);
     props->runtimeName[XR_MAX_RUNTIME_NAME_SIZE - 1] = '\0';
     Log("[SimXR] xrGetInstanceProperties: returning OpenXR Simulator Runtime");
@@ -3105,28 +3137,27 @@ static XrResult XRAPI_PTR xrCreateSession_runtime(XrInstance instance, const XrS
     Log("[SimXR] ============================================");
     Logf("[SimXR] xrCreateSession called (call #%d, instance=%llu)", sessionCount, (unsigned long long)instance);
     Log("[SimXR] ============================================");
-    if (!info || !session) return XR_ERROR_VALIDATION_FAILURE;
-    
-    // Check if we already have an active session
-    if (rt::g_session.handle != XR_NULL_HANDLE && rt::g_session.state != XR_SESSION_STATE_IDLE) {
-        Logf("[SimXR] xrCreateSession: ERROR - Session already exists (handle=%llu, state=%d)",
-            (unsigned long long)rt::g_session.handle, rt::g_session.state);
-        // For now, reset the existing session to allow the new one
-        // Reset session manually
-        rt::g_session.handle = XR_NULL_HANDLE;
-        rt::g_session.state = XR_SESSION_STATE_IDLE;
-        rt::g_session.d3d11Device.Reset();
-        rt::g_session.d3d11Context.Reset();
-        rt::g_session.previewSwapchain.Reset();
-        rt::g_session.usesD3D12 = false;
-        rt::g_session.d3d12Device.Reset();
-        rt::g_session.d3d12Queue.Reset();
-        rt::ResetD3D12PreviewResources(rt::g_session);
-        rt::g_session.previewWidth = 1920;
-        rt::g_session.previewHeight = 540;
-        rt::g_session.isFocused = false;
+    if (instance == XR_NULL_HANDLE || instance != rt::g_instance.handle) {
+        return XR_ERROR_HANDLE_INVALID;
     }
-    if (rt::g_session.usesVulkan) vkrt::ShutdownSession(rt::g_session);
+    if (!info || !session || info->type != XR_TYPE_SESSION_CREATE_INFO ||
+        info->createFlags != 0) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+    if (info->systemId != 1) return XR_ERROR_SYSTEM_INVALID;
+    if (rt::g_session.handle != XR_NULL_HANDLE) {
+        Logf("[SimXR] xrCreateSession: session limit reached (handle=%llu)",
+             (unsigned long long)rt::g_session.handle);
+        return XR_ERROR_LIMIT_REACHED;
+    }
+
+    const auto extensionEnabled = [](const char* name) {
+        return std::find(rt::g_instance.enabledExtensions.begin(),
+                         rt::g_instance.enabledExtensions.end(), name) !=
+               rt::g_instance.enabledExtensions.end();
+    };
+    static uintptr_t nextSessionHandle = 0x1001;
+    const XrSession newHandle = (XrSession)nextSessionHandle++;
     {
         std::lock_guard<std::mutex> lock(rt::g_session.frameMutex);
         rt::g_session.running = false;
@@ -3139,6 +3170,10 @@ static XrResult XRAPI_PTR xrCreateSession_runtime(XrInstance instance, const XrS
     while (entry) {
         if (entry->type == XR_TYPE_GRAPHICS_BINDING_D3D11_KHR) {
             const auto* b = reinterpret_cast<const XrGraphicsBindingD3D11KHR*>(entry);
+            if (!extensionEnabled(XR_KHR_D3D11_ENABLE_EXTENSION_NAME)) {
+                return XR_ERROR_VALIDATION_FAILURE;
+            }
+            if (!b->device) return XR_ERROR_GRAPHICS_DEVICE_INVALID;
             
             // Log the device details
             ComPtr<IDXGIDevice> dxgiDevice;
@@ -3153,8 +3188,7 @@ static XrResult XRAPI_PTR xrCreateSession_runtime(XrInstance instance, const XrS
                 }
             }
             
-            // Use sessionCount to generate unique handles
-            rt::g_session.handle = (XrSession)(uintptr_t)(0x1000 + sessionCount);
+            rt::g_session.handle = newHandle;
             rt::g_session.d3d11Device = b->device;
             rt::g_session.usesD3D12 = false;
             rt::g_session.d3d12Device.Reset();
@@ -3170,13 +3204,17 @@ static XrResult XRAPI_PTR xrCreateSession_runtime(XrInstance instance, const XrS
             return XR_SUCCESS;
         } else if (entry->type == XR_TYPE_GRAPHICS_BINDING_D3D12_KHR) {
             const auto* b12 = reinterpret_cast<const XrGraphicsBindingD3D12KHR*>(entry);
+            if (!extensionEnabled(XR_KHR_D3D12_ENABLE_EXTENSION_NAME)) {
+                return XR_ERROR_VALIDATION_FAILURE;
+            }
+            if (!b12->device || !b12->queue) return XR_ERROR_GRAPHICS_DEVICE_INVALID;
             rt::g_session.usesD3D12 = true;
             rt::g_session.d3d12Device = b12->device;
             rt::g_session.d3d12Queue = b12->queue;
             rt::g_session.d3d11Device.Reset();
             rt::g_session.d3d11Context.Reset();
             rt::g_session.previewSwapchain.Reset();
-            rt::g_session.handle = (XrSession)(uintptr_t)(0x1000 + sessionCount);
+            rt::g_session.handle = newHandle;
             *session = rt::g_session.handle;
             Logf("[SimXR] xrCreateSession: SUCCESS (D3D12, handle=%llu)", (unsigned long long)rt::g_session.handle);
             rt::PushState(rt::g_session.handle, XR_SESSION_STATE_READY);
@@ -3185,6 +3223,10 @@ static XrResult XRAPI_PTR xrCreateSession_runtime(XrInstance instance, const XrS
             // XR_TYPE_GRAPHICS_BINDING_VULKAN2_KHR is an alias of this, so one branch serves
             // XR_KHR_vulkan_enable and XR_KHR_vulkan_enable2 alike.
             const auto* bVk = reinterpret_cast<const XrGraphicsBindingVulkanKHR*>(entry);
+            if (!extensionEnabled(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) &&
+                !extensionEnabled(XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME)) {
+                return XR_ERROR_VALIDATION_FAILURE;
+            }
             rt::g_session.d3d11Device.Reset();
             rt::g_session.d3d11Context.Reset();
             rt::g_session.previewSwapchain.Reset();
@@ -3201,13 +3243,17 @@ static XrResult XRAPI_PTR xrCreateSession_runtime(XrInstance instance, const XrS
             // app is handed and how the two queues are ordered.
             rt::g_session.usesVulkan = true;
             rt::g_session.usesD3D12 = true;
-            rt::g_session.handle = (XrSession)(uintptr_t)(0x1000 + sessionCount);
+            rt::g_session.handle = newHandle;
             *session = rt::g_session.handle;
             Logf("[SimXR] xrCreateSession: SUCCESS (Vulkan, handle=%llu)", (unsigned long long)rt::g_session.handle);
             rt::PushState(rt::g_session.handle, XR_SESSION_STATE_READY);
             return XR_SUCCESS;
         } else if (entry->type == XR_TYPE_GRAPHICS_BINDING_OPENGL_WIN32_KHR) {
             const auto* bGL = reinterpret_cast<const XrGraphicsBindingOpenGLWin32KHR*>(entry);
+            if (!extensionEnabled(XR_KHR_OPENGL_ENABLE_EXTENSION_NAME)) {
+                return XR_ERROR_VALIDATION_FAILURE;
+            }
+            if (!bGL->hDC || !bGL->hGLRC) return XR_ERROR_GRAPHICS_DEVICE_INVALID;
             rt::g_session.usesOpenGL = true;
             rt::g_session.usesD3D12 = false;
             rt::g_session.glDC = bGL->hDC;
@@ -3217,7 +3263,7 @@ static XrResult XRAPI_PTR xrCreateSession_runtime(XrInstance instance, const XrS
             rt::g_session.d3d12Device.Reset();
             rt::g_session.d3d12Queue.Reset();
             rt::g_session.previewSwapchain.Reset();
-            rt::g_session.handle = (XrSession)(uintptr_t)(0x1000 + sessionCount);
+            rt::g_session.handle = newHandle;
             *session = rt::g_session.handle;
             Logf("[SimXR] xrCreateSession: SUCCESS (OpenGL, handle=%llu, hDC=%p, hGLRC=%p)",
                  (unsigned long long)rt::g_session.handle, bGL->hDC, bGL->hGLRC);

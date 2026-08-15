@@ -6,6 +6,14 @@
 
 namespace api_validation {
 
+inline XrResult ValidateApiVersion(XrVersion requested, XrVersion supported) {
+    if (requested == 0 || XR_VERSION_MAJOR(requested) != XR_VERSION_MAJOR(supported) ||
+        requested > supported) {
+        return XR_ERROR_API_VERSION_UNSUPPORTED;
+    }
+    return XR_SUCCESS;
+}
+
 template <typename T>
 inline XrResult ValidateEnumeration(uint32_t capacityInput, uint32_t* countOutput,
                                     T* values, uint32_t requiredCount) {
