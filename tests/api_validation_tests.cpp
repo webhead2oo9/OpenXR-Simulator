@@ -31,6 +31,14 @@ int main() {
           "a path level cannot contain only periods");
     Check(!api_validation::IsWellFormedPath("/User/hand"),
           "a path cannot contain uppercase characters");
+    Check(api_validation::IsWellFormedPathLevel("game_play-1.0", 32),
+          "an action name may contain path-level characters");
+    Check(!api_validation::IsWellFormedPathLevel("game/play", 32),
+          "an action name cannot contain a path separator");
+    Check(!api_validation::IsWellFormedPathLevel("..", 32),
+          "an action name cannot consist only of periods");
+    Check(!api_validation::IsWellFormedPathLevel("GamePlay", 32),
+          "an action name cannot contain uppercase characters");
 
     uint32_t count = 0;
     int values[2]{};

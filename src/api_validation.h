@@ -46,6 +46,22 @@ inline bool IsWellFormedPath(const char* path) {
     return true;
 }
 
+inline bool IsWellFormedPathLevel(const char* name, size_t capacity) {
+    if (!name || capacity == 0) return false;
+    const size_t length = strnlen(name, capacity);
+    if (length == 0 || length == capacity) return false;
+    bool onlyPeriods = true;
+    for (size_t index = 0; index < length; ++index) {
+        const char value = name[index];
+        const bool allowed = (value >= 'a' && value <= 'z') ||
+                             (value >= '0' && value <= '9') || value == '-' ||
+                             value == '_' || value == '.';
+        if (!allowed) return false;
+        if (value != '.') onlyPeriods = false;
+    }
+    return !onlyPeriods;
+}
+
 template <typename T>
 inline XrResult ValidateEnumeration(uint32_t capacityInput, uint32_t* countOutput,
                                     T* values, uint32_t requiredCount) {

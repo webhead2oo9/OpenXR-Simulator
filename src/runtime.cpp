@@ -763,6 +763,8 @@ struct ActionBinding {
 struct ActionSetRecord {
     uint32_t priority{0};
     bool everAttached{false};
+    std::string name;
+    std::string localizedName;
     std::unordered_set<XrPath> declaredSubactionPaths;
 };
 
@@ -770,6 +772,7 @@ struct ActionRecord {
     XrActionSet actionSet{XR_NULL_HANDLE};
     XrActionType type{XR_ACTION_TYPE_BOOLEAN_INPUT};
     std::string name;
+    std::string localizedName;
     int declaredHandMask{3};
     std::unordered_set<XrPath> declaredSubactionPaths;
     std::vector<ActionBinding> bindings;
@@ -8544,15 +8547,40 @@ static XrTime CurrentXrTime() {
     return seconds * 1000000000LL + (remainder * 1000000000LL) / frequency.QuadPart;
 }
 
-static XrResult XRAPI_PTR xrCreateActionSet_runtime(XrInstance, const XrActionSetCreateInfo* info, XrActionSet* set) {
-    if (!info || !set) return XR_ERROR_VALIDATION_FAILURE;
+static XrResult XRAPI_PTR xrCreateActionSet_runtime(
+    XrInstance instance, const XrActionSetCreateInfo* info, XrActionSet* set) {
+    if (!IsValidInstance(instance)) return XR_ERROR_HANDLE_INVALID;
+    if (!info || info->type != XR_TYPE_ACTION_SET_CREATE_INFO || !set) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+    const size_t nameLength = strnlen(info->actionSetName, XR_MAX_ACTION_SET_NAME_SIZE);
+    const size_t localizedLength =
+        strnlen(info->localizedActionSetName, XR_MAX_LOCALIZED_ACTION_SET_NAME_SIZE);
+    if (nameLength == XR_MAX_ACTION_SET_NAME_SIZE ||
+        localizedLength == XR_MAX_LOCALIZED_ACTION_SET_NAME_SIZE) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+    if (nameLength == 0) return XR_ERROR_NAME_INVALID;
+    if (localizedLength == 0) return XR_ERROR_LOCALIZED_NAME_INVALID;
+    if (!api_validation::IsWellFormedPathLevel(
+            info->actionSetName, XR_MAX_ACTION_SET_NAME_SIZE)) {
+        return XR_ERROR_PATH_FORMAT_INVALID;
+    }
+    for (const auto& entry : rt::g_actionSets) {
+        if (entry.second.name == info->actionSetName) return XR_ERROR_NAME_DUPLICATED;
+        if (entry.second.localizedName == info->localizedActionSetName) {
+            return XR_ERROR_LOCALIZED_NAME_DUPLICATED;
+        }
+    }
+
     static uintptr_t nextSet = 300;
     *set = (XrActionSet)(nextSet++);
-    // actionSetName may not be null-terminated
-    char setName[XR_MAX_ACTION_SET_NAME_SIZE + 1] = {0};
-    memcpy(setName, info->actionSetName, XR_MAX_ACTION_SET_NAME_SIZE);
-    Logf("[SimXR] xrCreateActionSet: name=%s", setName);
-    rt::g_actionSets.emplace(*set, rt::ActionSetRecord{info->priority});
+    Logf("[SimXR] xrCreateActionSet: name=%s", info->actionSetName);
+    rt::ActionSetRecord record;
+    record.priority = info->priority;
+    record.name = info->actionSetName;
+    record.localizedName = info->localizedActionSetName;
+    rt::g_actionSets.emplace(*set, std::move(record));
     return XR_SUCCESS;
 }
 
@@ -8578,15 +8606,40 @@ static XrResult XRAPI_PTR xrDestroyActionSet_runtime(XrActionSet set) {
 }
 
 static XrResult XRAPI_PTR xrCreateAction_runtime(XrActionSet actionSet, const XrActionCreateInfo* info, XrAction* action) {
-    if (!info || !action) return XR_ERROR_VALIDATION_FAILURE;
+    if (!info || info->type != XR_TYPE_ACTION_CREATE_INFO || !action) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
     auto setIt = rt::g_actionSets.find(actionSet);
     if (setIt == rt::g_actionSets.end()) return XR_ERROR_HANDLE_INVALID;
     if (setIt->second.everAttached) return XR_ERROR_ACTIONSETS_ALREADY_ATTACHED;
     if (info->countSubactionPaths && !info->subactionPaths) return XR_ERROR_VALIDATION_FAILURE;
-    // actionName may not be null-terminated
-    char actName[XR_MAX_ACTION_NAME_SIZE + 1] = {0};
-    memcpy(actName, info->actionName, XR_MAX_ACTION_NAME_SIZE);
-    Logf("[SimXR] xrCreateAction: name=%s, type=%d", actName, info->actionType);
+    if (info->actionType != XR_ACTION_TYPE_BOOLEAN_INPUT &&
+        info->actionType != XR_ACTION_TYPE_FLOAT_INPUT &&
+        info->actionType != XR_ACTION_TYPE_VECTOR2F_INPUT &&
+        info->actionType != XR_ACTION_TYPE_POSE_INPUT &&
+        info->actionType != XR_ACTION_TYPE_VIBRATION_OUTPUT) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+    const size_t nameLength = strnlen(info->actionName, XR_MAX_ACTION_NAME_SIZE);
+    const size_t localizedLength =
+        strnlen(info->localizedActionName, XR_MAX_LOCALIZED_ACTION_NAME_SIZE);
+    if (nameLength == XR_MAX_ACTION_NAME_SIZE ||
+        localizedLength == XR_MAX_LOCALIZED_ACTION_NAME_SIZE) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+    if (nameLength == 0) return XR_ERROR_NAME_INVALID;
+    if (localizedLength == 0) return XR_ERROR_LOCALIZED_NAME_INVALID;
+    if (!api_validation::IsWellFormedPathLevel(info->actionName, XR_MAX_ACTION_NAME_SIZE)) {
+        return XR_ERROR_PATH_FORMAT_INVALID;
+    }
+    for (const auto& entry : rt::g_actions) {
+        if (entry.second.actionSet != actionSet) continue;
+        if (entry.second.name == info->actionName) return XR_ERROR_NAME_DUPLICATED;
+        if (entry.second.localizedName == info->localizedActionName) {
+            return XR_ERROR_LOCALIZED_NAME_DUPLICATED;
+        }
+    }
+    Logf("[SimXR] xrCreateAction: name=%s, type=%d", info->actionName, info->actionType);
 
     int handBinding = info->countSubactionPaths == 0 ? 3 : 0;
     std::unordered_set<XrPath> declaredPaths;
@@ -8604,7 +8657,8 @@ static XrResult XRAPI_PTR xrCreateAction_runtime(XrActionSet actionSet, const Xr
     rt::ActionRecord record;
     record.actionSet = actionSet;
     record.type = info->actionType;
-    record.name = actName;
+    record.name = info->actionName;
+    record.localizedName = info->localizedActionName;
     record.declaredHandMask = handBinding;
     record.declaredSubactionPaths = declaredPaths;
     rt::g_actions.emplace(*action, std::move(record));
