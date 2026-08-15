@@ -29,6 +29,23 @@ void CheckOrientation(const XrPosef& pose, float x, float y, float z, float w, c
 } // namespace
 
 int main() {
+    Check(pose_math::IsNormalized({0.0f, 0.0f, 0.0f, 1.0f}),
+          "an identity quaternion is normalized");
+    Check(pose_math::IsNormalized({0.0f, 0.0f, 0.0f, 1.009f}),
+          "the specification's one-percent norm tolerance is accepted");
+    Check(!pose_math::IsNormalized({0.0f, 0.0f, 0.0f, 1.011f}),
+          "a quaternion outside the one-percent norm tolerance is rejected");
+    Check(!pose_math::IsNormalized({0.0f, 0.0f, 0.0f, NAN}),
+          "a non-finite quaternion is rejected");
+    const XrQuaternionf normalized = pose_math::Normalize({0.0f, 0.0f, 0.0f, 1.009f});
+    Check(Near(normalized.w, 1.0f),
+          "an accepted near-unit quaternion is normalized for pose math");
+    const XrVector3f leverArmVelocity =
+        pose_math::Cross({0.0f, 1.0f, 0.0f}, {2.0f, 0.0f, 0.0f});
+    Check(Near(leverArmVelocity.x, 0.0f) && Near(leverArmVelocity.y, 0.0f) &&
+              Near(leverArmVelocity.z, -2.0f),
+          "angular velocity contributes the expected lever-arm velocity");
+
     const XrPosef identity = pose_math::Identity();
     const XrPosef worldSpace{{0.0f, 0.0f, 0.0f, 1.0f}, {4.0f, 5.0f, 6.0f}};
     CheckPosition(pose_math::Relative(worldSpace, identity), 4.0f, 5.0f, 6.0f,

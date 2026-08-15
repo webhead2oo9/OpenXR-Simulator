@@ -714,10 +714,13 @@ static ControllerState g_rightController = {
 };
 
 struct ActionSpace {
+    XrAction action{XR_NULL_HANDLE};
+    XrPath subactionPath{XR_NULL_PATH};
     int controllerType{0}; // 0 = unbound, 1 = left, 2 = right
     XrPosef poseInActionSpace{pose_math::Identity()};
 };
 static std::unordered_map<XrSpace, ActionSpace> g_controllerSpaces;
+static uintptr_t g_nextSpaceHandle{100};
 
 // Composition layers carry a pose plus the space it is in, and VIEW (head-locked)
 // against STAGE (world) changes where the layer belongs entirely.
@@ -8029,26 +8032,61 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession session, const XrFrameEnd
     return result;
 }
 
-static bool GetSpaceWorldPose(XrSpace space, XrPosef& worldPose, bool& tracked) {
+struct SpaceWorldState {
+    XrPosef pose{pose_math::Identity()};
+    bool tracked{false};
+    bool velocityValid{false};
+    XrVector3f linearVelocity{};
+    XrVector3f angularVelocity{};
+};
+
+static bool GetSpaceWorldState(XrSpace space, SpaceWorldState& state) {
     auto actionIt = rt::g_controllerSpaces.find(space);
     if (actionIt != rt::g_controllerSpaces.end()) {
         const rt::ActionSpace& actionSpace = actionIt->second;
-        if (actionSpace.controllerType == 0) {
-            worldPose = pose_math::Identity();
-            tracked = false;
+        auto actionRecordIt = rt::g_actions.find(actionSpace.action);
+        if (actionRecordIt == rt::g_actions.end()) return false;
+        const rt::ActionRecord& action = actionRecordIt->second;
+        auto activeSetIt = rt::g_activeActionSetHands.find(action.actionSet);
+        if (activeSetIt == rt::g_activeActionSetHands.end()) return true;
+
+        int controllerType = actionSpace.controllerType;
+        if (controllerType == 0) {
+            for (const rt::ActionBinding& binding : action.bindings) {
+                if (binding.profile == rt::g_activeProfile &&
+                    binding.input == rt::ActionInput::Pose &&
+                    (binding.handMask & activeSetIt->second & action.declaredHandMask)) {
+                    const int candidate = (binding.handMask & 1) ? 1 : 2;
+                    if (action.slots[candidate].poseActive) {
+                        controllerType = candidate;
+                        break;
+                    }
+                }
+            }
+        }
+        const int slot = controllerType == 1 ? 1 : controllerType == 2 ? 2 : 0;
+        if (controllerType == 0 || !(activeSetIt->second & controllerType) ||
+            !action.slots[slot].poseActive) {
             return true;
         }
-        const rt::ControllerState& controller = actionSpace.controllerType == 1
+        const rt::ControllerState& controller = controllerType == 1
             ? rt::g_leftController : rt::g_rightController;
-        if (!controller.isTracking) {
-            worldPose = pose_math::Identity();
-            tracked = false;
-            return true;
-        }
+        if (!controller.isTracking) return true;
         XrPosef controllerWorld{};
         rt::GetControllerPose(controller, &controllerWorld);
-        worldPose = pose_math::Compose(controllerWorld, actionSpace.poseInActionSpace);
-        tracked = true;
+        const XrVector3f offsetWorld =
+            pose_math::Rotate(controllerWorld.orientation, actionSpace.poseInActionSpace.position);
+        const XrVector3f offsetVelocity =
+            pose_math::Cross(controller.angularVelocity, offsetWorld);
+        state.pose = pose_math::Compose(controllerWorld, actionSpace.poseInActionSpace);
+        state.tracked = true;
+        state.velocityValid = true;
+        state.linearVelocity = {
+            controller.linearVelocity.x + offsetVelocity.x,
+            controller.linearVelocity.y + offsetVelocity.y,
+            controller.linearVelocity.z + offsetVelocity.z,
+        };
+        state.angularVelocity = controller.angularVelocity;
         return true;
     }
 
@@ -8061,21 +8099,56 @@ static bool GetSpaceWorldPose(XrSpace space, XrPosef& worldPose, bool& tracked) 
         naturalOrigin.orientation = rt::QuatFromYawPitchRoll(yaw, pitch, roll);
         naturalOrigin.position = rt::g_headPos;
     }
-    worldPose = pose_math::Compose(naturalOrigin, referenceIt->second.poseInRef);
-    tracked = true;
+    state.pose = pose_math::Compose(naturalOrigin, referenceIt->second.poseInRef);
+    state.tracked = true;
+    // LOCAL and STAGE are static in the simulator's world frame. VIEW motion is
+    // not sampled with enough history to advertise a trustworthy velocity.
+    state.velocityValid = referenceIt->second.type != XR_REFERENCE_SPACE_TYPE_VIEW;
     return true;
+}
+
+static bool GetCommonEntityRelativePose(XrSpace space, XrSpace baseSpace, XrPosef& pose) {
+    if (space == baseSpace) {
+        pose = pose_math::Identity();
+        return true;
+    }
+
+    auto spaceAction = rt::g_controllerSpaces.find(space);
+    auto baseAction = rt::g_controllerSpaces.find(baseSpace);
+    if (spaceAction != rt::g_controllerSpaces.end() &&
+        baseAction != rt::g_controllerSpaces.end() &&
+        spaceAction->second.action == baseAction->second.action &&
+        spaceAction->second.subactionPath == baseAction->second.subactionPath) {
+        pose = pose_math::Relative(spaceAction->second.poseInActionSpace,
+                                   baseAction->second.poseInActionSpace);
+        return true;
+    }
+
+    auto spaceReference = rt::g_referenceSpaces.find(space);
+    auto baseReference = rt::g_referenceSpaces.find(baseSpace);
+    if (spaceReference != rt::g_referenceSpaces.end() &&
+        baseReference != rt::g_referenceSpaces.end() &&
+        spaceReference->second.type == baseReference->second.type) {
+        pose = pose_math::Relative(spaceReference->second.poseInRef,
+                                   baseReference->second.poseInRef);
+        return true;
+    }
+    return false;
 }
 
 static XrResult XRAPI_PTR xrLocateViews_runtime(XrSession session, const XrViewLocateInfo* li, XrViewState* vs, uint32_t cap, uint32_t* outCount, XrView* views) {
     if (!li || !vs || !outCount || li->type != XR_TYPE_VIEW_LOCATE_INFO ||
         vs->type != XR_TYPE_VIEW_STATE) return XR_ERROR_VALIDATION_FAILURE;
     if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
+    if (li->viewConfigurationType != XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO) {
+        return XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED;
+    }
+    if (li->displayTime <= 0) return XR_ERROR_TIME_INVALID;
     *outCount = 2;
 
-    XrPosef baseWorld{};
-    bool baseTracked = false;
-    if (!GetSpaceWorldPose(li->space, baseWorld, baseTracked)) return XR_ERROR_HANDLE_INVALID;
-    vs->viewStateFlags = baseTracked
+    SpaceWorldState baseState;
+    if (!GetSpaceWorldState(li->space, baseState)) return XR_ERROR_HANDLE_INVALID;
+    vs->viewStateFlags = baseState.tracked
         ? XR_VIEW_STATE_ORIENTATION_VALID_BIT | XR_VIEW_STATE_POSITION_VALID_BIT |
           XR_VIEW_STATE_ORIENTATION_TRACKED_BIT | XR_VIEW_STATE_POSITION_TRACKED_BIT
         : 0;
@@ -8090,7 +8163,7 @@ static XrResult XRAPI_PTR xrLocateViews_runtime(XrSession session, const XrViewL
     }
     for (uint32_t i = 0; i < 2; ++i) {
         const XrPosef eyeWorld = rt::ViewPoseFromAngles(i, effYaw, effPitch, effRoll);
-        views[i].pose = pose_math::Relative(eyeWorld, baseWorld);
+        views[i].pose = pose_math::Relative(eyeWorld, baseState.pose);
         views[i].fov = rt::GetViewFov(i);
     }
     static int locateCount = 0;
@@ -8103,11 +8176,24 @@ static XrResult XRAPI_PTR xrLocateViews_runtime(XrSession session, const XrViewL
 }
 
 // Add missing space/action functions for compatibility
-static XrResult XRAPI_PTR xrCreateReferenceSpace_runtime(XrSession, const XrReferenceSpaceCreateInfo* info, XrSpace* space) {
-    if (!info || !space) return XR_ERROR_VALIDATION_FAILURE;
-    static uintptr_t nextSpace = 100;
-    *space = (XrSpace)(nextSpace++);
-    rt::g_referenceSpaces[*space] = rt::RefSpace{ info->referenceSpaceType, info->poseInReferenceSpace };
+static XrResult XRAPI_PTR xrCreateReferenceSpace_runtime(
+    XrSession session, const XrReferenceSpaceCreateInfo* info, XrSpace* space) {
+    if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
+    if (!info || info->type != XR_TYPE_REFERENCE_SPACE_CREATE_INFO || !space) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+    if (info->referenceSpaceType != XR_REFERENCE_SPACE_TYPE_VIEW &&
+        info->referenceSpaceType != XR_REFERENCE_SPACE_TYPE_LOCAL &&
+        info->referenceSpaceType != XR_REFERENCE_SPACE_TYPE_STAGE) {
+        return XR_ERROR_REFERENCE_SPACE_UNSUPPORTED;
+    }
+    if (!pose_math::IsNormalized(info->poseInReferenceSpace.orientation)) {
+        return XR_ERROR_POSE_INVALID;
+    }
+    XrPosef pose = info->poseInReferenceSpace;
+    pose.orientation = pose_math::Normalize(pose.orientation);
+    *space = (XrSpace)(rt::g_nextSpaceHandle++);
+    rt::g_referenceSpaces[*space] = rt::RefSpace{info->referenceSpaceType, pose};
     Logf("[SimXR] xrCreateReferenceSpace: type=%d space=%p", info->referenceSpaceType, *space);
     return XR_SUCCESS;
 }
@@ -8122,17 +8208,30 @@ static XrResult XRAPI_PTR xrDestroySpace_runtime(XrSpace space) {
 static XrResult XRAPI_PTR xrLocateSpace_runtime(XrSpace space, XrSpace baseSpace, XrTime time, XrSpaceLocation* location) {
     if (!location) return XR_ERROR_VALIDATION_FAILURE;
     if (location->type != XR_TYPE_SPACE_LOCATION) return XR_ERROR_VALIDATION_FAILURE;
+    if (time <= 0) return XR_ERROR_TIME_INVALID;
 
     XrSpaceVelocity* velocity = reinterpret_cast<XrSpaceVelocity*>(location->next);
     if (velocity && velocity->type == XR_TYPE_SPACE_VELOCITY) velocity->velocityFlags = 0;
 
-    XrPosef spaceWorld{}, baseWorld{};
-    bool spaceTracked = false, baseTracked = false;
-    if (!GetSpaceWorldPose(space, spaceWorld, spaceTracked) ||
-        !GetSpaceWorldPose(baseSpace, baseWorld, baseTracked)) {
+    SpaceWorldState spaceState, baseState;
+    if (!GetSpaceWorldState(space, spaceState) ||
+        !GetSpaceWorldState(baseSpace, baseState)) {
         return XR_ERROR_HANDLE_INVALID;
     }
-    if (!spaceTracked || !baseTracked) {
+    if (GetCommonEntityRelativePose(space, baseSpace, location->pose)) {
+        location->locationFlags = XR_SPACE_LOCATION_POSITION_VALID_BIT |
+                                  XR_SPACE_LOCATION_ORIENTATION_VALID_BIT |
+                                  XR_SPACE_LOCATION_POSITION_TRACKED_BIT |
+                                  XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
+        if (velocity && velocity->type == XR_TYPE_SPACE_VELOCITY) {
+            velocity->velocityFlags = XR_SPACE_VELOCITY_LINEAR_VALID_BIT |
+                                      XR_SPACE_VELOCITY_ANGULAR_VALID_BIT;
+            velocity->linearVelocity = {};
+            velocity->angularVelocity = {};
+        }
+        return XR_SUCCESS;
+    }
+    if (!spaceState.tracked || !baseState.tracked) {
         location->locationFlags = 0;
         location->pose = pose_math::Identity();
         return XR_SUCCESS;
@@ -8142,17 +8241,32 @@ static XrResult XRAPI_PTR xrLocateSpace_runtime(XrSpace space, XrSpace baseSpace
                               XR_SPACE_LOCATION_ORIENTATION_VALID_BIT |
                               XR_SPACE_LOCATION_POSITION_TRACKED_BIT |
                               XR_SPACE_LOCATION_ORIENTATION_TRACKED_BIT;
-    location->pose = pose_math::Relative(spaceWorld, baseWorld);
+    location->pose = pose_math::Relative(spaceState.pose, baseState.pose);
 
-    auto actionIt = rt::g_controllerSpaces.find(space);
-    if (actionIt != rt::g_controllerSpaces.end() && actionIt->second.controllerType != 0 &&
-        velocity && velocity->type == XR_TYPE_SPACE_VELOCITY) {
-        const rt::ControllerState& controller = actionIt->second.controllerType == 1
-            ? rt::g_leftController : rt::g_rightController;
-        const XrQuaternionf worldToBase = pose_math::Inverse(baseWorld.orientation);
-        velocity->velocityFlags = XR_SPACE_VELOCITY_LINEAR_VALID_BIT | XR_SPACE_VELOCITY_ANGULAR_VALID_BIT;
-        velocity->linearVelocity = pose_math::Rotate(worldToBase, controller.linearVelocity);
-        velocity->angularVelocity = pose_math::Rotate(worldToBase, controller.angularVelocity);
+    if (velocity && velocity->type == XR_TYPE_SPACE_VELOCITY &&
+        spaceState.velocityValid && baseState.velocityValid) {
+        const XrQuaternionf worldToBase = pose_math::Inverse(baseState.pose.orientation);
+        const XrVector3f worldSeparation{
+            spaceState.pose.position.x - baseState.pose.position.x,
+            spaceState.pose.position.y - baseState.pose.position.y,
+            spaceState.pose.position.z - baseState.pose.position.z,
+        };
+        const XrVector3f rotatingBaseVelocity =
+            pose_math::Cross(baseState.angularVelocity, worldSeparation);
+        const XrVector3f relativeLinearWorld{
+            spaceState.linearVelocity.x - baseState.linearVelocity.x - rotatingBaseVelocity.x,
+            spaceState.linearVelocity.y - baseState.linearVelocity.y - rotatingBaseVelocity.y,
+            spaceState.linearVelocity.z - baseState.linearVelocity.z - rotatingBaseVelocity.z,
+        };
+        const XrVector3f relativeAngularWorld{
+            spaceState.angularVelocity.x - baseState.angularVelocity.x,
+            spaceState.angularVelocity.y - baseState.angularVelocity.y,
+            spaceState.angularVelocity.z - baseState.angularVelocity.z,
+        };
+        velocity->velocityFlags = XR_SPACE_VELOCITY_LINEAR_VALID_BIT |
+                                  XR_SPACE_VELOCITY_ANGULAR_VALID_BIT;
+        velocity->linearVelocity = pose_math::Rotate(worldToBase, relativeLinearWorld);
+        velocity->angularVelocity = pose_math::Rotate(worldToBase, relativeAngularWorld);
     }
     return XR_SUCCESS;
 }
@@ -8167,36 +8281,39 @@ static XrResult XRAPI_PTR xrEnumerateReferenceSpaces_runtime(XrSession session, 
     return XR_SUCCESS;
 }
 
-static XrResult XRAPI_PTR xrCreateActionSpace_runtime(XrSession, const XrActionSpaceCreateInfo* info, XrSpace* space) {
-    if (!info || !space) return XR_ERROR_VALIDATION_FAILURE;
-    static uintptr_t nextSpace = 200;
-    *space = (XrSpace)(nextSpace++);
+static XrResult XRAPI_PTR xrCreateActionSpace_runtime(
+    XrSession session, const XrActionSpaceCreateInfo* info, XrSpace* space) {
+    if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
+    if (!info || info->type != XR_TYPE_ACTION_SPACE_CREATE_INFO || !space) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+    auto actionIt = rt::g_actions.find(info->action);
+    if (actionIt == rt::g_actions.end()) return XR_ERROR_HANDLE_INVALID;
+    if (actionIt->second.type != XR_ACTION_TYPE_POSE_INPUT) {
+        return XR_ERROR_ACTION_TYPE_MISMATCH;
+    }
+    if (!pose_math::IsNormalized(info->poseInActionSpace.orientation)) {
+        return XR_ERROR_POSE_INVALID;
+    }
 
-    // Detect controller subaction paths and register the space
+    // Detect controller subaction paths and register the space.
     int controllerType = 0;  // 0=none, 1=left, 2=right
-    Logf("[SimXR] xrCreateActionSpace: subactionPath=%llu, g_pathStrings.size()=%zu",
-         (unsigned long long)info->subactionPath, rt::g_pathStrings.size());
 
     if (info->subactionPath != XR_NULL_PATH) {
         auto it = rt::g_pathStrings.find(info->subactionPath);
-        if (it != rt::g_pathStrings.end()) {
-            const std::string& pathStr = it->second;
-            Logf("[SimXR] xrCreateActionSpace: found path='%s'", pathStr.c_str());
-            if (pathStr == "/user/hand/left") {
-                controllerType = 1;  // Left controller
-                Logf("[SimXR] xrCreateActionSpace: LEFT controller space %llu", (unsigned long long)*space);
-            } else if (pathStr == "/user/hand/right") {
-                controllerType = 2;  // Right controller
-                Logf("[SimXR] xrCreateActionSpace: RIGHT controller space %llu", (unsigned long long)*space);
-            }
-        } else {
-            Logf("[SimXR] xrCreateActionSpace: path %llu NOT FOUND in g_pathStrings", (unsigned long long)info->subactionPath);
+        if (it == rt::g_pathStrings.end()) return XR_ERROR_PATH_INVALID;
+        if (!actionIt->second.declaredSubactionPaths.count(info->subactionPath)) {
+            return XR_ERROR_PATH_UNSUPPORTED;
         }
-    } else {
-        Log("[SimXR] xrCreateActionSpace: subactionPath is XR_NULL_PATH");
+        if (it->second == "/user/hand/left") controllerType = 1;
+        else if (it->second == "/user/hand/right") controllerType = 2;
     }
 
-    rt::g_controllerSpaces[*space] = rt::ActionSpace{controllerType, info->poseInActionSpace};
+    *space = (XrSpace)(rt::g_nextSpaceHandle++);
+    XrPosef pose = info->poseInActionSpace;
+    pose.orientation = pose_math::Normalize(pose.orientation);
+    rt::g_controllerSpaces[*space] = rt::ActionSpace{
+        info->action, info->subactionPath, controllerType, pose};
 
     Log("[SimXR] xrCreateActionSpace");
     return XR_SUCCESS;
@@ -8418,8 +8535,17 @@ static XrResult XRAPI_PTR xrDestroyActionSet_runtime(XrActionSet set) {
     rt::g_attachedActionSets.erase(set);
     rt::g_activeActionSetHands.erase(set);
     for (auto it = rt::g_actions.begin(); it != rt::g_actions.end();) {
-        if (it->second.actionSet == set) it = rt::g_actions.erase(it);
-        else ++it;
+        if (it->second.actionSet != set) {
+            ++it;
+            continue;
+        }
+        const XrAction action = it->first;
+        for (auto spaceIt = rt::g_controllerSpaces.begin();
+             spaceIt != rt::g_controllerSpaces.end();) {
+            if (spaceIt->second.action == action) spaceIt = rt::g_controllerSpaces.erase(spaceIt);
+            else ++spaceIt;
+        }
+        it = rt::g_actions.erase(it);
     }
     return XR_SUCCESS;
 }
@@ -8465,6 +8591,11 @@ static XrResult XRAPI_PTR xrDestroyAction_runtime(XrAction action) {
     auto actionIt = rt::g_actions.find(action);
     if (actionIt == rt::g_actions.end()) return XR_ERROR_HANDLE_INVALID;
     const XrActionSet actionSet = actionIt->second.actionSet;
+    for (auto spaceIt = rt::g_controllerSpaces.begin();
+         spaceIt != rt::g_controllerSpaces.end();) {
+        if (spaceIt->second.action == action) spaceIt = rt::g_controllerSpaces.erase(spaceIt);
+        else ++spaceIt;
+    }
     rt::g_actions.erase(actionIt);
     auto setIt = rt::g_actionSets.find(actionSet);
     if (setIt != rt::g_actionSets.end()) {
@@ -8992,11 +9123,20 @@ static XrResult XRAPI_PTR xrStructureTypeToString_runtime(
     return XR_SUCCESS;
 }
 
-static XrResult XRAPI_PTR xrGetReferenceSpaceBoundsRect_runtime(XrSession, XrReferenceSpaceType, XrExtent2Df* bounds) {
+static XrResult XRAPI_PTR xrGetReferenceSpaceBoundsRect_runtime(
+    XrSession session, XrReferenceSpaceType type, XrExtent2Df* bounds) {
+    if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
     if (!bounds) return XR_ERROR_VALIDATION_FAILURE;
-    bounds->width = 3.0f;
-    bounds->height = 3.0f;
-    Log("[SimXR] xrGetReferenceSpaceBoundsRect: 3x3 meters");
+    if (type != XR_REFERENCE_SPACE_TYPE_VIEW && type != XR_REFERENCE_SPACE_TYPE_LOCAL &&
+        type != XR_REFERENCE_SPACE_TYPE_STAGE) {
+        return XR_ERROR_REFERENCE_SPACE_UNSUPPORTED;
+    }
+    if (type != XR_REFERENCE_SPACE_TYPE_STAGE) {
+        *bounds = {0.0f, 0.0f};
+        return XR_SPACE_BOUNDS_UNAVAILABLE;
+    }
+    *bounds = {3.0f, 3.0f};
+    Log("[SimXR] xrGetReferenceSpaceBoundsRect: STAGE is 3x3 meters");
     return XR_SUCCESS;
 }
 

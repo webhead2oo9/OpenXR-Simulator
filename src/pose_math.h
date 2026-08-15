@@ -2,7 +2,20 @@
 
 #include <openxr/openxr.h>
 
+#include <cmath>
+
 namespace pose_math {
+
+inline bool IsNormalized(const XrQuaternionf& q) {
+    const float norm = std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
+    return std::isfinite(norm) && std::fabs(norm - 1.0f) <= 0.01f;
+}
+
+inline XrQuaternionf Normalize(const XrQuaternionf& q) {
+    const float inverseNorm = 1.0f /
+        std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z + q.w * q.w);
+    return {q.x * inverseNorm, q.y * inverseNorm, q.z * inverseNorm, q.w * inverseNorm};
+}
 
 inline XrQuaternionf Multiply(const XrQuaternionf& a, const XrQuaternionf& b) {
     return {
@@ -21,6 +34,14 @@ inline XrVector3f Rotate(const XrQuaternionf& q, const XrVector3f& value) {
     const XrQuaternionf vector{value.x, value.y, value.z, 0.0f};
     const XrQuaternionf result = Multiply(Multiply(q, vector), Inverse(q));
     return {result.x, result.y, result.z};
+}
+
+inline XrVector3f Cross(const XrVector3f& a, const XrVector3f& b) {
+    return {
+        a.y * b.z - a.z * b.y,
+        a.z * b.x - a.x * b.z,
+        a.x * b.y - a.y * b.x,
+    };
 }
 
 inline XrPosef Compose(const XrPosef& parent, const XrPosef& child) {
