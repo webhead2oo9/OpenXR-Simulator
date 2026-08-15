@@ -749,6 +749,7 @@ enum class ActionInput {
     Secondary,
     Thumbstick,
     Pose,
+    Haptic,
 };
 
 struct ActionBinding {
@@ -8406,6 +8407,15 @@ static rt::ActionInput InputForBindingPath(XrActionType type, const std::string&
         if (componentFor("thumbstick", component) && component.empty()) return rt::ActionInput::Thumbstick;
         return rt::ActionInput::Unknown;
     }
+    if (type == XR_ACTION_TYPE_VIBRATION_OUTPUT) {
+        constexpr const char* suffix = "/output/haptic";
+        constexpr size_t suffixLength = 14;
+        if (path.size() >= suffixLength &&
+            path.compare(path.size() - suffixLength, suffixLength, suffix) == 0) {
+            return rt::ActionInput::Haptic;
+        }
+        return rt::ActionInput::Unknown;
+    }
     return rt::ActionInput::Unknown;
 }
 
@@ -9173,13 +9183,52 @@ static XrResult XRAPI_PTR xrGetViewConfigurationProperties_runtime(XrInstance in
     return XR_SUCCESS;
 }
 
-static XrResult XRAPI_PTR xrApplyHapticFeedback_runtime(XrSession, const XrHapticActionInfo* info, const XrHapticBaseHeader* haptic) {
-    // Just stub for now
+static XrResult ValidateHapticActionInfo(
+    XrSession session, const XrHapticActionInfo* info) {
+    if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
+    if (!info || info->type != XR_TYPE_HAPTIC_ACTION_INFO) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+    auto actionIt = rt::g_actions.find(info->action);
+    if (actionIt == rt::g_actions.end()) return XR_ERROR_HANDLE_INVALID;
+    if (actionIt->second.type != XR_ACTION_TYPE_VIBRATION_OUTPUT) {
+        return XR_ERROR_ACTION_TYPE_MISMATCH;
+    }
+    if (!rt::g_attachedActionSets.count(actionIt->second.actionSet)) {
+        return XR_ERROR_ACTIONSET_NOT_ATTACHED;
+    }
+    if (info->subactionPath != XR_NULL_PATH) {
+        if (!rt::g_pathStrings.count(info->subactionPath)) return XR_ERROR_PATH_INVALID;
+        if (!HandMaskForTopLevelPath(info->subactionPath) ||
+            !actionIt->second.declaredSubactionPaths.count(info->subactionPath)) {
+            return XR_ERROR_PATH_UNSUPPORTED;
+        }
+    }
     return XR_SUCCESS;
 }
 
-static XrResult XRAPI_PTR xrStopHapticFeedback_runtime(XrSession, const XrHapticActionInfo* info) {
-    // Just stub for now
+static XrResult XRAPI_PTR xrApplyHapticFeedback_runtime(
+    XrSession session, const XrHapticActionInfo* info, const XrHapticBaseHeader* haptic) {
+    XrResult result = ValidateHapticActionInfo(session, info);
+    if (XR_FAILED(result)) return result;
+    if (!haptic || haptic->type != XR_TYPE_HAPTIC_VIBRATION) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+    result = input::ValidateHapticVibration(
+        *reinterpret_cast<const XrHapticVibration*>(haptic));
+    if (XR_FAILED(result)) return result;
+    if (rt::g_session.state != XR_SESSION_STATE_FOCUSED) return XR_SESSION_NOT_FOCUSED;
+
+    // The simulator has no physical vibration device. OpenXR permits a runtime to
+    // ignore a valid request when no appropriate device is available.
+    return XR_SUCCESS;
+}
+
+static XrResult XRAPI_PTR xrStopHapticFeedback_runtime(
+    XrSession session, const XrHapticActionInfo* info) {
+    const XrResult result = ValidateHapticActionInfo(session, info);
+    if (XR_FAILED(result)) return result;
+    if (rt::g_session.state != XR_SESSION_STATE_FOCUSED) return XR_SESSION_NOT_FOCUSED;
     return XR_SUCCESS;
 }
 

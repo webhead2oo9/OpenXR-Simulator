@@ -2,10 +2,21 @@
 
 #include <openxr/openxr.h>
 
+#include <cmath>
 #include <string>
 #include <unordered_map>
 
 namespace input {
+
+inline XrResult ValidateHapticVibration(const XrHapticVibration& vibration) {
+    if ((vibration.duration != XR_MIN_HAPTIC_DURATION && vibration.duration <= 0) ||
+        !std::isfinite(vibration.frequency) || vibration.frequency < 0.0f ||
+        !std::isfinite(vibration.amplitude) ||
+        vibration.amplitude < 0.0f || vibration.amplitude > 1.0f) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+    return XR_SUCCESS;
+}
 
 template <size_t N>
 inline bool BindingPathAllowed(const std::string& value, const char* const (&leafPaths)[N]) {

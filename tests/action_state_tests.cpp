@@ -1,6 +1,7 @@
 #include "action_state.h"
 #include "interaction_query.h"
 
+#include <cmath>
 #include <cstdio>
 
 namespace {
@@ -16,6 +17,34 @@ void Check(bool condition, const char* message) {
 } // namespace
 
 int main() {
+    XrHapticVibration vibration{XR_TYPE_HAPTIC_VIBRATION};
+    vibration.duration = XR_MIN_HAPTIC_DURATION;
+    vibration.frequency = XR_FREQUENCY_UNSPECIFIED;
+    vibration.amplitude = 1.0f;
+    Check(input::ValidateHapticVibration(vibration) == XR_SUCCESS,
+          "minimum-duration vibration with unspecified frequency is valid");
+    vibration.duration = 1;
+    vibration.amplitude = 0.0f;
+    Check(input::ValidateHapticVibration(vibration) == XR_SUCCESS,
+          "finite positive duration and zero amplitude are valid");
+    vibration.duration = 0;
+    Check(input::ValidateHapticVibration(vibration) == XR_ERROR_VALIDATION_FAILURE,
+          "zero haptic duration is invalid");
+    vibration.duration = 1;
+    vibration.frequency = -1.0f;
+    Check(input::ValidateHapticVibration(vibration) == XR_ERROR_VALIDATION_FAILURE,
+          "negative haptic frequency is invalid");
+    vibration.frequency = NAN;
+    Check(input::ValidateHapticVibration(vibration) == XR_ERROR_VALIDATION_FAILURE,
+          "non-finite haptic frequency is invalid");
+    vibration.frequency = 1.0f;
+    vibration.amplitude = 1.01f;
+    Check(input::ValidateHapticVibration(vibration) == XR_ERROR_VALIDATION_FAILURE,
+          "haptic amplitude above one is invalid");
+    vibration.amplitude = NAN;
+    Check(input::ValidateHapticVibration(vibration) == XR_ERROR_VALIDATION_FAILURE,
+          "non-finite haptic amplitude is invalid");
+
     input::LatchedValue<XrBool32> button;
 
     button.Sync(XR_FALSE, true, 100);
