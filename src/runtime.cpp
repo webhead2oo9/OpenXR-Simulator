@@ -5434,18 +5434,20 @@ static ID3D11Texture2D* acquireTempTexture(rt::Session& s, rt::Session::TempTexE
 static bool readGLSubImage(GLuint texture, const rt::Swapchain& chain, uint32_t arrayIndex,
                            const rt::SubImageRect& rect, std::vector<uint8_t>& scratch,
                            std::vector<uint8_t>& output, uint32_t outputWidth,
-                           uint32_t outputHeight) {
+                           uint32_t outputHeight, bool reuseReadback = false) {
     const uint32_t layers = chain.arraySize ? chain.arraySize : 1;
     const uint64_t layerBytes64 = (uint64_t)chain.width * chain.height * 4;
     if (!texture || layerBytes64 == 0 || layerBytes64 > SIZE_MAX) return false;
     const size_t layerBytes = (size_t)layerBytes64;
     if (layers > SIZE_MAX / layerBytes) return false;
-    scratch.resize(layerBytes * layers);
-
-    const GLenum target = layers > 1 ? GL_TEXTURE_2D_ARRAY : GL_TEXTURE_2D;
-    glBindTexture(target, texture);
-    glPixelStorei(GL_PACK_ALIGNMENT, 1);
-    glGetTexImage(target, 0, GL_RGBA, GL_UNSIGNED_BYTE, scratch.data());
+    const size_t readbackBytes = layerBytes * layers;
+    if (!reuseReadback || scratch.size() != readbackBytes) {
+        scratch.resize(readbackBytes);
+        const GLenum target = layers > 1 ? GL_TEXTURE_2D_ARRAY : GL_TEXTURE_2D;
+        glBindTexture(target, texture);
+        glPixelStorei(GL_PACK_ALIGNMENT, 1);
+        glGetTexImage(target, 0, GL_RGBA, GL_UNSIGNED_BYTE, scratch.data());
+    }
 
     return composition_render::CopyRgbaSubImage(
         scratch.data(), scratch.size(), chain.width, chain.height, layers, arrayIndex,
@@ -6753,7 +6755,8 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
     }
 }
 
-static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) {
+static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad,
+                            bool reuseGLReadback = false, bool countAsLayer = true) {
     if (!quad) return;
     // D3D12 sessions use previewRT12, not previewSwapchain
     if (!s.previewSwapchain && !s.previewRT12) return;
@@ -6810,7 +6813,7 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) 
         rt::PreviewFrame12* slot = beginPreviewSlot(s);
         if (!slot) return;
         if (!beginPreviewRT(s, *slot)) return;
-        ++slot->quadLayers;
+        if (countAsLayer) ++slot->quadLayers;
 
         const D3D12_RESOURCE_DESC rtDesc = s.previewRT12->GetDesc();
         const int rtWidth = (int)rtDesc.Width, rtHeight = (int)rtDesc.Height;
@@ -7024,7 +7027,8 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) 
         // ignored imageRect offsets, while glGetTexImage wrote past this crop-sized buffer.
         std::vector<uint8_t>& pixels = s.glQuadPixels;   // reused across frames
         if (!readGLSubImage(glTex, chain, quad->subImage.imageArrayIndex, qrect,
-                            s.glQuadReadback, pixels, texWidth, texHeight)) {
+                            s.glQuadReadback, pixels, texWidth, texHeight,
+                            reuseGLReadback)) {
             if (savedRC) wglMakeCurrent(savedDC, savedRC);
             return;
         }
@@ -7333,6 +7337,68 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad) 
     // Cleanup
     ID3D11ShaderResourceView* nullSRV[1] = { nullptr };
     s.d3d11Context->PSSetShaderResources(0, 1, nullSRV);
+}
+
+static bool renderCylinderLayer(rt::Session& session,
+                                const XrCompositionLayerCylinderKHR* cylinder) {
+    if (!cylinder) return false;
+    const std::vector<composition_render::CylinderSegment> segments =
+        composition_render::BuildCylinderSegments(*cylinder);
+    if (segments.empty()) return false;
+
+    // Approximate the curved surface with chord quads. Adjacent chords share exact
+    // endpoints, their source rectangles partition the submitted image without overlap,
+    // and each local +Z normal points inward toward the cylinder origin.
+    float yaw, pitch, roll;
+    rt::GetEffectiveHeadAngles(yaw, pitch, roll);
+    bool texturePrepared = false;
+    bool layerCounted = false;
+    for (size_t index = 0; index < segments.size(); ++index) {
+        const composition_render::CylinderSegment& segment = segments[index];
+        const float halfYaw = -segment.centerAngle * 0.5f;
+        XrPosef local{};
+        local.orientation = {0.0f, std::sin(halfYaw), 0.0f, std::cos(halfYaw)};
+        local.position = segment.position;
+
+        XrCompositionLayerQuad quad{XR_TYPE_COMPOSITION_LAYER_QUAD};
+        quad.layerFlags = cylinder->layerFlags;
+        quad.space = cylinder->space;
+        quad.eyeVisibility = cylinder->eyeVisibility;
+        quad.subImage = cylinder->subImage;
+        quad.subImage.imageRect = segment.imageRect;
+        quad.pose = pose_math::Compose(cylinder->pose, local);
+        quad.size = {segment.width, segment.height};
+
+        // The extension explicitly exposes only the inside surface. Cull each eye against
+        // the inward-facing chord normal before handing the segment to the two-sided quad
+        // renderer.
+        const XrPosef world = rt::QuadWorldPose(quad, yaw, pitch, roll);
+        const XrVector3f normal = pose_math::Rotate(world.orientation, {0.0f, 0.0f, 1.0f});
+        bool visible[2] = {};
+        for (uint32_t eye = 0; eye < 2; ++eye) {
+            if (!rt::QuadVisibleInEye(cylinder->eyeVisibility, eye)) continue;
+            const XrPosef view = rt::ViewPoseFromAngles(eye, yaw, pitch, roll);
+            const XrVector3f toEye{view.position.x - world.position.x,
+                                   view.position.y - world.position.y,
+                                   view.position.z - world.position.z};
+            visible[eye] = normal.x * toEye.x + normal.y * toEye.y +
+                           normal.z * toEye.z > 0.0f;
+        }
+        if (!visible[0] && !visible[1]) continue;
+        quad.eyeVisibility = visible[0] && visible[1] ? XR_EYE_VISIBILITY_BOTH
+                           : visible[0] ? XR_EYE_VISIBILITY_LEFT
+                                        : XR_EYE_VISIBILITY_RIGHT;
+        renderQuadLayer(session, &quad, texturePrepared, !layerCounted);
+        texturePrepared = true;
+        layerCounted = true;
+    }
+
+    static uint64_t cylinderLogCount = 0;
+    if (g_logVerbose && (++cylinderLogCount <= 5 || cylinderLogCount % 120 == 1)) {
+        Logf("[SimXR] Cylinder layer: radius=%.3f angle=%.3f aspect=%.3f segments=%zu",
+             cylinder->radius, cylinder->centralAngle, cylinder->aspectRatio, segments.size());
+    }
+    return layerCounted;
 }
 
 // Draw the newest preview frame the GPU has actually finished into the GDI back buffer.
@@ -7692,7 +7758,13 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession session, const XrFrameEnd
                 break;
             }
             case XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR: {
-                // TODO: Implement cylinder layer rendering
+                const auto* cylinder =
+                    reinterpret_cast<const XrCompositionLayerCylinderKHR*>(base);
+                if (composition_render::HasPixels(*cylinder)) {
+                    if (!compositionStarted) prepareOverlayCanvas(true);
+                    compositionStarted = renderCylinderLayer(rt::g_session, cylinder) ||
+                                         compositionStarted;
+                }
                 QueryPerformanceCounter(&layerFinish);
                 overlayTicks += layerFinish.QuadPart - layerStart.QuadPart;
                 break;

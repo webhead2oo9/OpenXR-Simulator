@@ -79,6 +79,36 @@ int main() {
               source.data(), source.size() - 1, 3, 2, 2, 1, {0, 0, 3, 2}, 3, 2, copied),
           "a truncated full-texture readback is rejected");
 
+    XrCompositionLayerCylinderKHR cylinder{};
+    cylinder.subImage.imageRect = Rect(10, 20, 360, 180);
+    cylinder.radius = 2.0f;
+    cylinder.centralAngle = 1.5707963268f;
+    cylinder.aspectRatio = 2.0f;
+    const auto segments = composition_render::BuildCylinderSegments(cylinder);
+    Check(segments.size() == 18, "a ninety-degree cylinder uses five-degree segments");
+    Check(segments.front().imageRect.offset.x == 10 &&
+              segments.back().imageRect.offset.x + segments.back().imageRect.extent.width == 370,
+          "cylinder segments cover the complete source rectangle");
+    Check(std::abs(segments.front().height - 1.5707963268f) < 0.0001f,
+          "cylinder height is arc length divided by aspect ratio");
+    const auto& left = segments.front();
+    const auto& right = segments.back();
+    Check(std::abs(left.position.x + right.position.x) < 0.0001f &&
+              std::abs(left.position.z - right.position.z) < 0.0001f,
+          "the tessellation is symmetric around local negative Z");
+    const auto& next = segments[1];
+    const float leftRightX = left.position.x + left.width * 0.5f * std::cos(left.centerAngle);
+    const float leftRightZ = left.position.z + left.width * 0.5f * std::sin(left.centerAngle);
+    const float nextLeftX = next.position.x - next.width * 0.5f * std::cos(next.centerAngle);
+    const float nextLeftZ = next.position.z - next.width * 0.5f * std::sin(next.centerAngle);
+    Check(std::abs(leftRightX - nextLeftX) < 0.0001f &&
+              std::abs(leftRightZ - nextLeftZ) < 0.0001f,
+          "adjacent cylinder chords share exact endpoints");
+    cylinder.radius = 0.0f;
+    const auto infiniteSegments = composition_render::BuildCylinderSegments(cylinder);
+    Check(!infiniteSegments.empty() && std::isfinite(infiniteSegments[0].position.z),
+          "an infinite cylinder receives a finite angular approximation");
+
     if (failures) return 1;
     std::puts("composition render tests passed");
     return 0;

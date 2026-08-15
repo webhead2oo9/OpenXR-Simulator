@@ -3,6 +3,7 @@
 #include <openxr/openxr.h>
 
 #include <algorithm>
+#include <cmath>
 #include <cstdint>
 #include <cstring>
 #include <limits>
@@ -73,6 +74,64 @@ inline bool HasPixels(const XrCompositionLayerProjection& projection) {
 inline bool HasPixels(const XrCompositionLayerQuad& quad) {
     return quad.size.width > 0.0f && quad.size.height > 0.0f &&
            HasPixels(quad.subImage.imageRect);
+}
+
+inline bool HasPixels(const XrCompositionLayerCylinderKHR& cylinder) {
+    return cylinder.centralAngle > 0.0f && cylinder.aspectRatio > 0.0f &&
+           HasPixels(cylinder.subImage.imageRect);
+}
+
+struct CylinderSegment {
+    float centerAngle{0.0f};
+    XrVector3f position{};
+    float width{0.0f};
+    float height{0.0f};
+    XrRect2Di imageRect{};
+};
+
+inline std::vector<CylinderSegment> BuildCylinderSegments(
+    const XrCompositionLayerCylinderKHR& cylinder,
+    float maximumSegmentAngle = 0.0872664626f) { // five degrees
+    std::vector<CylinderSegment> result;
+    if (!HasPixels(cylinder) || !std::isfinite(maximumSegmentAngle) ||
+        maximumSegmentAngle <= 0.0f) {
+        return result;
+    }
+
+    // Zero and positive infinity designate an infinite cylinder. A large finite radius
+    // preserves its angular dimensions while making translation parallax negligible in
+    // the desktop compositor, whose projection has no finite far plane.
+    const float radius = (cylinder.radius > 0.0f && std::isfinite(cylinder.radius))
+        ? cylinder.radius : 1000.0f;
+    const float exactCount = cylinder.centralAngle / maximumSegmentAngle;
+    uint32_t count = (uint32_t)std::ceil(exactCount - 1e-5f);
+    count = (std::max)(1u, (std::min)(72u, count));
+    count = (std::min)(count, (uint32_t)cylinder.subImage.imageRect.extent.width);
+    if (count == 0) return result;
+
+    result.reserve(count);
+    const float angleStep = cylinder.centralAngle / count;
+    const float chordRadius = radius * std::cos(angleStep * 0.5f);
+    const float chordWidth = 2.0f * radius * std::sin(angleStep * 0.5f);
+    const float height = radius * cylinder.centralAngle / cylinder.aspectRatio;
+    const int32_t sourceX = cylinder.subImage.imageRect.offset.x;
+    const int32_t sourceWidth = cylinder.subImage.imageRect.extent.width;
+    for (uint32_t index = 0; index < count; ++index) {
+        const float centerAngle = -cylinder.centralAngle * 0.5f +
+                                  (index + 0.5f) * angleStep;
+        const int32_t x0 = sourceX + (int32_t)((int64_t)sourceWidth * index / count);
+        const int32_t x1 = sourceX + (int32_t)((int64_t)sourceWidth * (index + 1) / count);
+        CylinderSegment segment{};
+        segment.centerAngle = centerAngle;
+        segment.position = {chordRadius * std::sin(centerAngle), 0.0f,
+                            -chordRadius * std::cos(centerAngle)};
+        segment.width = chordWidth;
+        segment.height = height;
+        segment.imageRect = {{x0, cylinder.subImage.imageRect.offset.y},
+                             {x1 - x0, cylinder.subImage.imageRect.extent.height}};
+        result.push_back(segment);
+    }
+    return result;
 }
 
 inline bool CopyRgbaSubImage(const uint8_t* source, size_t sourceBytes,
