@@ -21,6 +21,23 @@ XrRect2Di Rect(int32_t x, int32_t y, int32_t width, int32_t height) {
 int main() {
     using composition_render::ResolveSubImageRect;
 
+    Check(composition_render::BlendForLayerFlags(0) ==
+              composition_render::LayerBlend::Opaque,
+          "source alpha is ignored unless explicitly enabled");
+    Check(composition_render::BlendForLayerFlags(
+              XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT) ==
+              composition_render::LayerBlend::Premultiplied,
+          "source alpha defaults to premultiplied color");
+    Check(composition_render::BlendForLayerFlags(
+              XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT |
+              XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT) ==
+              composition_render::LayerBlend::Unpremultiplied,
+          "the unpremultiplied flag selects straight-alpha blending");
+    Check(composition_render::BlendForLayerFlags(
+              XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT) ==
+              composition_render::LayerBlend::Opaque,
+          "the unpremultiplied flag alone does not enable source alpha");
+
     const auto full = ResolveSubImageRect(Rect(0, 0, 1024, 512), 1024, 512, false);
     Check(full.x == 0 && full.y == 0 && full.w == 1024 && full.h == 512,
           "a full-image rectangle remains unchanged");

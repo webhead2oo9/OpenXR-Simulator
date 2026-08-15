@@ -352,10 +352,9 @@ struct Instance {
 // The D3D12 preview back buffer is always BGRA8, whatever the app submits: that is the
 // byte layout of the GDI DIB section it is copied into, so the readback needs no swizzle.
 static constexpr DXGI_FORMAT kPreviewRTFormat = DXGI_FORMAT_B8G8R8A8_UNORM;
-// The eyes are written through kPreviewRTFormat, which passes their already-encoded bytes
-// straight through. Quad layers are blended through this view of the same resource instead,
-// so the hardware decodes the destination to linear, blends, and re-encodes. The resource
-// itself is TYPELESS to allow both views.
+// Composition is rendered through the sRGB view so linear formats are encoded and sRGB
+// formats are decoded before blending. The plain view remains useful for clear/readback
+// descriptions. The resource itself is TYPELESS to allow both views.
 static constexpr DXGI_FORMAT kPreviewRTFormatTypeless = DXGI_FORMAT_B8G8R8A8_TYPELESS;
 static constexpr DXGI_FORMAT kPreviewRTFormatSrgb = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
 // Shader-visible SRVs, ringed so a descriptor is not rewritten while a command list that
@@ -478,13 +477,14 @@ struct Session {
     // not the stereo render's - a 5120x1440 submission mirrored into a 1280x360 fit rect
     // is 30MB a frame off the GPU and a CPU-side resample either way without this.
     ComPtr<ID3D12RootSignature> previewRootSig;
-    ComPtr<ID3D12PipelineState> previewPSO;
+    // Projection layers use the same three OpenXR alpha modes as quad layers.
+    ComPtr<ID3D12PipelineState> previewPSO[3];
     // Quad layers are rasterised into the same RT through an sRGB view; one PSO per
     // rt::LayerBlend mode.
     ComPtr<ID3D12RootSignature> previewQuadRootSig;
     ComPtr<ID3D12PipelineState> previewQuadPSO[3];
     ComPtr<ID3D12DescriptorHeap> previewSrvHeap;
-    // Two RTVs over previewRT12: [0] plain, for the eye pass; [1] sRGB, for quad blending.
+    // Two RTVs over previewRT12: [0] plain for clears/copies; [1] sRGB for composition.
     ComPtr<ID3D12DescriptorHeap> previewRtvHeap;
     UINT previewRtvStride{0};
     UINT previewSrvStride{0};
@@ -528,6 +528,7 @@ struct Session {
     ComPtr<ID3D11Texture2D> glEyeTex[2];
     ComPtr<ID3D11ShaderResourceView> glEyeSrv[2];
     UINT glEyeTexW{0}, glEyeTexH{0};
+    DXGI_FORMAT glEyeSrvFormat[2]{DXGI_FORMAT_UNKNOWN, DXGI_FORMAT_UNKNOWN};
 
     // Desktop preview window (no thread - handled on main thread)
     HWND hwnd{nullptr};
@@ -882,13 +883,8 @@ static XrFovf GetViewFov(uint32_t eye) {
 // BLEND_TEXTURE_SOURCE_ALPHA is set, and is premultiplied into the colour channels unless
 // UNPREMULTIPLIED_ALPHA says otherwise. CORRECT_CHROMATIC_ABERRATION is a legitimate no-op
 // here - the preview draws no distortion mesh to correct.
-enum class LayerBlend { Opaque, Premultiplied, Unpremultiplied };
-
-static inline LayerBlend BlendForLayerFlags(XrCompositionLayerFlags flags) {
-    if (!(flags & XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT)) return LayerBlend::Opaque;
-    return (flags & XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT) ? LayerBlend::Unpremultiplied
-                                                                    : LayerBlend::Premultiplied;
-}
+using composition_render::LayerBlend;
+using composition_render::BlendForLayerFlags;
 
 // The preview swapchain is created UNORM because FLIP_DISCARD rejects _SRGB, so every render
 // target view over it has to opt back into the gamma encode by hand. Without this the GPU
@@ -1404,23 +1400,6 @@ static void ResizeWindowForContent(HWND hWnd) {
                  SWP_NOMOVE | SWP_NOZORDER);
 }
 
-// View format for sampling a D3D12 swapchain image in the preview's scaling pass. The
-// resource can be typeless (XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT), and sRGB is dropped
-// on purpose: the pass filters the bytes in whatever encoding they are stored in and
-// writes them through unchanged, which is what the GDI stretch it replaced did.
-static DXGI_FORMAT PreviewSrvFormat(DXGI_FORMAT resourceFormat) {
-    switch (resourceFormat) {
-        case DXGI_FORMAT_R8G8B8A8_TYPELESS:
-        case DXGI_FORMAT_R8G8B8A8_UNORM_SRGB:     return DXGI_FORMAT_R8G8B8A8_UNORM;
-        case DXGI_FORMAT_B8G8R8A8_TYPELESS:
-        case DXGI_FORMAT_B8G8R8A8_UNORM_SRGB:     return DXGI_FORMAT_B8G8R8A8_UNORM;
-        case DXGI_FORMAT_R16G16B16A16_TYPELESS:   return DXGI_FORMAT_R16G16B16A16_FLOAT;
-        case DXGI_FORMAT_R32G32B32A32_TYPELESS:   return DXGI_FORMAT_R32G32B32A32_FLOAT;
-        case DXGI_FORMAT_R10G10B10A2_TYPELESS:    return DXGI_FORMAT_R10G10B10A2_UNORM;
-        default:                                  return resourceFormat;
-    }
-}
-
 // Block until the last composite handed to the preview queue has run. Leaves the pending
 // slots alone, so whatever is waiting to be painted still gets painted.
 static void WaitForPreviewFence(rt::Session& s) {
@@ -1476,7 +1455,7 @@ static void ResetD3D12PreviewResources(rt::Session& s) {
     // Device-owned, so they cannot outlive the session that created them.
     s.previewRtvHeap.Reset();
     s.previewSrvHeap.Reset();
-    s.previewPSO.Reset();
+    for (auto& pso : s.previewPSO) pso.Reset();
     s.previewRootSig.Reset();
     s.previewSrvSlot = 0;
     s.crossQueueFence.Reset();
@@ -2007,10 +1986,10 @@ static bool LoadDeviceLevel(VkDevice dev) {
 }
 
 // --- formats ------------------------------------------------------------------------------
-// The pairing is the DXGI format the shared resource is created with. Colour keeps the
-// typed sRGB/UNORM format (PreviewSrvFormat casts it to a UNORM view for the eye pass, so
-// the encoded bytes pass through unchanged); depth goes typeless, which is both what a DSV
-// wants and what BetterVR's own shared depth textures use.
+// The pairing is the DXGI format the shared resource is created with. Color keeps the
+// typed sRGB/UNORM format so composition samples it with the declared transfer function;
+// depth goes typeless, which is both what a DSV wants and what BetterVR's own shared depth
+// textures use.
 struct FormatPair { int64_t vk; DXGI_FORMAT typed; DXGI_FORMAT resource; bool depth; };
 
 static const FormatPair kFormats[] = {
@@ -4994,13 +4973,17 @@ float4 PSMain(VSOut i) : SV_Target {
 }
 )HLSL";
 
-// SRV format for sampling a quad layer. Unlike the eye pass - which filters the stored bytes
-// in whatever encoding they are in and writes them straight through - the quad is blended, so
-// the sample has to come back as linear light. Keeping the sRGB view is what does that.
-static DXGI_FORMAT PreviewQuadSrvFormat(DXGI_FORMAT resourceFormat) {
+// SRV format for composition. An sRGB declaration selects a decoding view; all other
+// color formats are sampled as linear, as required by OpenXR's composition color rules.
+static DXGI_FORMAT PreviewLinearSrvFormat(DXGI_FORMAT resourceFormat,
+                                          DXGI_FORMAT declaredFormat) {
     switch (resourceFormat) {
-        case DXGI_FORMAT_R8G8B8A8_TYPELESS:       return DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
-        case DXGI_FORMAT_B8G8R8A8_TYPELESS:       return DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+        case DXGI_FORMAT_R8G8B8A8_TYPELESS:
+            return declaredFormat == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+                 ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM;
+        case DXGI_FORMAT_B8G8R8A8_TYPELESS:
+            return declaredFormat == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
+                 ? DXGI_FORMAT_B8G8R8A8_UNORM_SRGB : DXGI_FORMAT_B8G8R8A8_UNORM;
         case DXGI_FORMAT_R16G16B16A16_TYPELESS:   return DXGI_FORMAT_R16G16B16A16_FLOAT;
         case DXGI_FORMAT_R32G32B32A32_TYPELESS:   return DXGI_FORMAT_R32G32B32A32_FLOAT;
         case DXGI_FORMAT_R10G10B10A2_TYPELESS:    return DXGI_FORMAT_R10G10B10A2_UNORM;
@@ -5101,7 +5084,7 @@ static bool ensurePreviewQuadPipeline(rt::Session& s) {
         pso.RasterizerState.DepthClipEnable = TRUE;
         pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
         pso.NumRenderTargets = 1;
-        // sRGB view over the same bytes the eye pass wrote, so the blend runs in linear light.
+        // All composition targets the sRGB view, so the blend runs in linear light.
         pso.RTVFormats[0] = rt::kPreviewRTFormatSrgb;
         pso.SampleDesc.Count = 1;
         hr = s.d3d12Device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(s.previewQuadPSO[mode].GetAddressOf()));
@@ -5116,7 +5099,8 @@ static bool ensurePreviewQuadPipeline(rt::Session& s) {
 }
 
 static bool ensurePreviewBlitPipeline(rt::Session& s) {
-    if (s.previewPSO && s.previewRootSig && s.previewSrvHeap) return true;
+    if (s.previewPSO[0] && s.previewPSO[1] && s.previewPSO[2] &&
+        s.previewRootSig && s.previewSrvHeap) return true;
     if (!s.d3d12Device) return false;
 
     D3D12_DESCRIPTOR_RANGE srvRange = {};
@@ -5184,23 +5168,38 @@ static bool ensurePreviewBlitPipeline(rt::Session& s) {
         return false;
     }
 
-    D3D12_GRAPHICS_PIPELINE_STATE_DESC pso = {};
-    pso.pRootSignature = s.previewRootSig.Get();
-    pso.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
-    pso.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
-    pso.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
-    pso.SampleMask = UINT_MAX;
-    pso.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
-    pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
-    pso.RasterizerState.DepthClipEnable = TRUE;
-    pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
-    pso.NumRenderTargets = 1;
-    pso.RTVFormats[0] = rt::kPreviewRTFormat;
-    pso.SampleDesc.Count = 1;
-    hr = s.d3d12Device->CreateGraphicsPipelineState(&pso, IID_PPV_ARGS(s.previewPSO.GetAddressOf()));
-    if (FAILED(hr)) {
-        Logf("[SimXR] DX12 preview: CreateGraphicsPipelineState failed 0x%08X", (unsigned)hr);
-        return false;
+    for (int mode = 0; mode < 3; ++mode) {
+        D3D12_GRAPHICS_PIPELINE_STATE_DESC pso = {};
+        pso.pRootSignature = s.previewRootSig.Get();
+        pso.VS = { vs->GetBufferPointer(), vs->GetBufferSize() };
+        pso.PS = { ps->GetBufferPointer(), ps->GetBufferSize() };
+        D3D12_RENDER_TARGET_BLEND_DESC& target = pso.BlendState.RenderTarget[0];
+        target.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+        if (mode != (int)rt::LayerBlend::Opaque) {
+            target.BlendEnable = TRUE;
+            target.SrcBlend = (mode == (int)rt::LayerBlend::Premultiplied)
+                            ? D3D12_BLEND_ONE : D3D12_BLEND_SRC_ALPHA;
+            target.DestBlend = D3D12_BLEND_INV_SRC_ALPHA;
+            target.BlendOp = D3D12_BLEND_OP_ADD;
+            target.SrcBlendAlpha = D3D12_BLEND_ONE;
+            target.DestBlendAlpha = D3D12_BLEND_INV_SRC_ALPHA;
+            target.BlendOpAlpha = D3D12_BLEND_OP_ADD;
+        }
+        pso.SampleMask = UINT_MAX;
+        pso.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+        pso.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+        pso.RasterizerState.DepthClipEnable = TRUE;
+        pso.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+        pso.NumRenderTargets = 1;
+        pso.RTVFormats[0] = rt::kPreviewRTFormatSrgb;
+        pso.SampleDesc.Count = 1;
+        hr = s.d3d12Device->CreateGraphicsPipelineState(
+            &pso, IID_PPV_ARGS(s.previewPSO[mode].GetAddressOf()));
+        if (FAILED(hr)) {
+            Logf("[SimXR] DX12 preview: CreateGraphicsPipelineState(%d) failed 0x%08X",
+                 mode, (unsigned)hr);
+            return false;
+        }
     }
 
     // See kPreviewSrvSlots for how the ring is sized against the frames in flight.
@@ -5372,8 +5371,8 @@ static void ensurePreviewSized(rt::Session& s, UINT width, UINT height, DXGI_FOR
             return;
         }
         s.previewRtvStride = s.d3d12Device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
-        // [0] plain view: the eye pass writes already-encoded bytes through unchanged.
-        // [1] sRGB view: quad blending decodes/re-encodes so the blend is in linear light.
+        // [0] plain view for clearing/copy descriptions. [1] sRGB view for every layer,
+        // so both opaque writes and alpha composition leave consistently encoded bytes.
         D3D12_CPU_DESCRIPTOR_HANDLE rtvBase = s.previewRtvHeap->GetCPUDescriptorHandleForHeapStart();
         D3D12_RENDER_TARGET_VIEW_DESC rtvDesc = {};
         rtvDesc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
@@ -5991,9 +5990,11 @@ static void paintPreviewComposite(rt::Session& s, rt::PreviewFrame12& f) {
 static void blitD3D12ToPreview(rt::Session& s,
                                 rt::Swapchain& chainL, uint32_t leftIdx, uint32_t leftSlice, const rt::SubImageRect& rectL,
                                 rt::Swapchain* chainR, uint32_t rightIdx, uint32_t rightSlice, const rt::SubImageRect& rectR,
-                                ui::DisplayLayout layout, ui::ViewMode viewMode) {
+                                ui::DisplayLayout layout, ui::ViewMode viewMode,
+                                rt::LayerBlend blendMode) {
     if (!s.previewRT12 || !s.previewCmdList ||
-        !s.previewRtvHeap || !s.previewSrvHeap || !s.previewRootSig || !s.previewPSO) {
+        !s.previewRtvHeap || !s.previewSrvHeap || !s.previewRootSig ||
+        !s.previewPSO[(int)blendMode]) {
         Log("[SimXR] blitD3D12ToPreview: Missing D3D12 preview resources");
         return;
     }
@@ -6033,11 +6034,10 @@ static void blitD3D12ToPreview(rt::Session& s,
     UINT rtWidth = (UINT)rtDesc.Width;
     UINT rtHeight = rtDesc.Height;
 
-    // Plain (non-sRGB) view: the eye pass writes the source bytes through in the encoding
-    // they are stored in, so nothing must convert them on the way out.
-    const D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = s.previewRtvHeap->GetCPUDescriptorHandleForHeapStart();
+    D3D12_CPU_DESCRIPTOR_HANDLE rtvHandle = s.previewRtvHeap->GetCPUDescriptorHandleForHeapStart();
+    rtvHandle.ptr += s.previewRtvStride;
     s.previewCmdList->SetGraphicsRootSignature(s.previewRootSig.Get());
-    s.previewCmdList->SetPipelineState(s.previewPSO.Get());
+    s.previewCmdList->SetPipelineState(s.previewPSO[(int)blendMode].Get());
     s.previewCmdList->OMSetRenderTargets(1, &rtvHandle, FALSE, nullptr);
 
     auto drawEye = [&](rt::Swapchain& chain, uint32_t idx, uint32_t slice, const rt::SubImageRect& rect,
@@ -6070,7 +6070,7 @@ static void blitD3D12ToPreview(rt::Session& s,
         }
 
         D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-        srvDesc.Format = rt::PreviewSrvFormat(sd.Format);
+        srvDesc.Format = PreviewLinearSrvFormat(sd.Format, (DXGI_FORMAT)chain.format);
         srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         if (sd.DepthOrArraySize > 1) {
             srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
@@ -6232,6 +6232,7 @@ static void updatePreviewTitle(rt::Session& s) {
 static void presentProjection(rt::Session& s, const XrCompositionLayerProjection& proj,
                               bool skipPresent = false, bool clearTarget = true) {
     LogV("[SimXR] ============================================");
+    const rt::LayerBlend blendMode = rt::BlendForLayerFlags(proj.layerFlags);
     LogVf("[SimXR] presentProjection called: viewCount=%u, skipPresent=%d", proj.viewCount, (int)skipPresent);
     LogV("[SimXR] RENDERING FRAME TO PREVIEW WINDOW");
     LogV("[SimXR] ============================================");
@@ -6478,6 +6479,7 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
                 for (int eye = 0; eye < 2; ++eye) {
                     s.glEyeTex[eye].Reset();
                     s.glEyeSrv[eye].Reset();
+                    s.glEyeSrvFormat[eye] = DXGI_FORMAT_UNKNOWN;
                 }
                 s.glEyeTexW = s.glEyeTexH = 0;
                 Log("[SimXR] Reset blit resources for fresh shader compilation");
@@ -6512,30 +6514,43 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
                 return;
             }
 
-            // Upload GL pixel data into cached textures; the pair is recreated only
-            // when the eye size changes rather than on every mirrored frame.
-            if (s.glEyeTexW != width || s.glEyeTexH != height || !s.glEyeTex[0]) {
+            // glGetTexImage returns the encoded bytes of GL_SRGB8_ALPHA8. Give those
+            // bytes an sRGB SRV so sampling decodes them before either an opaque copy or
+            // an alpha blend writes through the sRGB preview RTV. Other color formats
+            // are read back as linear RGBA8 and keep a UNORM SRV.
+            const DXGI_FORMAT eyeFormats[2] = {
+                chL.glInternalFormat == GL_SRGB8_ALPHA8
+                    ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM,
+                chRPtr && chRPtr->glInternalFormat == GL_SRGB8_ALPHA8
+                    ? DXGI_FORMAT_R8G8B8A8_UNORM_SRGB : DXGI_FORMAT_R8G8B8A8_UNORM,
+            };
+            const bool eyeSizeChanged = s.glEyeTexW != width || s.glEyeTexH != height;
+            for (int eye = 0; eye < 2; ++eye) {
+                if (!eyeSizeChanged && s.glEyeTex[eye] &&
+                    s.glEyeSrvFormat[eye] == eyeFormats[eye]) {
+                    continue;
+                }
                 D3D11_TEXTURE2D_DESC texDesc = {};
                 texDesc.Width = width;
                 texDesc.Height = height;
                 texDesc.MipLevels = 1;
                 texDesc.ArraySize = 1;
-                texDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                texDesc.Format = eyeFormats[eye];
                 texDesc.SampleDesc.Count = 1;
                 texDesc.Usage = D3D11_USAGE_DEFAULT;
                 texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-                for (int eye = 0; eye < 2; ++eye) {
-                    s.glEyeTex[eye].Reset();
-                    s.glEyeSrv[eye].Reset();
-                    if (SUCCEEDED(s.d3d11Device->CreateTexture2D(&texDesc, nullptr,
-                                                                 s.glEyeTex[eye].GetAddressOf()))) {
-                        s.d3d11Device->CreateShaderResourceView(s.glEyeTex[eye].Get(), nullptr,
-                                                                s.glEyeSrv[eye].GetAddressOf());
-                    }
+                s.glEyeTex[eye].Reset();
+                s.glEyeSrv[eye].Reset();
+                s.glEyeSrvFormat[eye] = DXGI_FORMAT_UNKNOWN;
+                if (SUCCEEDED(s.d3d11Device->CreateTexture2D(
+                        &texDesc, nullptr, s.glEyeTex[eye].GetAddressOf())) &&
+                    SUCCEEDED(s.d3d11Device->CreateShaderResourceView(
+                        s.glEyeTex[eye].Get(), nullptr, s.glEyeSrv[eye].GetAddressOf()))) {
+                    s.glEyeSrvFormat[eye] = eyeFormats[eye];
                 }
-                s.glEyeTexW = width;
-                s.glEyeTexH = height;
             }
+            s.glEyeTexW = width;
+            s.glEyeTexH = height;
             if (leftTex != 0 && s.glEyeTex[0]) {
                 s.d3d11Context->UpdateSubresource(s.glEyeTex[0].Get(), 0, nullptr,
                                                   leftPixels.data(), width * 4, 0);
@@ -6558,7 +6573,7 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
 
             // Create render target view for the backbuffer
             ComPtr<ID3D11RenderTargetView> rtv;
-            if (FAILED(s.d3d11Device->CreateRenderTargetView(bb.Get(), nullptr, rtv.GetAddressOf()))) {
+            if (!rt::CreatePreviewRtv(s, bb.Get(), rtv)) {
                 Log("[SimXR] OpenGL preview: Failed to create RTV");
                 return;
             }
@@ -6599,7 +6614,8 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
             }
 
             // Helper lambda to blit a texture to a viewport
-            auto blitTexture = [&](ID3D11ShaderResourceView* srv, const D3D11_VIEWPORT& vp) {
+            auto blitTexture = [&](ID3D11ShaderResourceView* srv, const D3D11_VIEWPORT& vp,
+                                   ID3D11BlendState* blend) {
                 if (!srv) {
                     if (glFrameCount % 60 == 1) Log("[SimXR] GL PREVIEW: blitTexture - SRV is null!");
                     return;
@@ -6625,7 +6641,7 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
 
                 s.d3d11Context->IASetInputLayout(nullptr);
                 s.d3d11Context->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP);
-                s.d3d11Context->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFF);
+                s.d3d11Context->OMSetBlendState(blend, nullptr, 0xFFFFFFFF);
                 s.d3d11Context->OMSetDepthStencilState(nullptr, 0);
                 s.d3d11Context->RSSetState(s.noCullRS.Get());
 
@@ -6636,23 +6652,34 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
                 s.d3d11Context->PSSetShaderResources(0, 1, nullSRV);
             };
 
+            const UINT8 rgbMask = D3D11_COLOR_WRITE_ENABLE_RED |
+                                  D3D11_COLOR_WRITE_ENABLE_GREEN |
+                                  D3D11_COLOR_WRITE_ENABLE_BLUE;
+            ID3D11BlendState* leftBlend = rt::GetLayerBlendState(s, blendMode, rgbMask);
+            ID3D11BlendState* rightBlend = leftBlend;
+            if (!singleEye && layout == ui::DisplayLayout::Anaglyph) {
+                leftBlend = rt::GetLayerBlendState(s, blendMode, D3D11_COLOR_WRITE_ENABLE_RED);
+                rightBlend = rt::GetLayerBlendState(
+                    s, blendMode, D3D11_COLOR_WRITE_ENABLE_GREEN | D3D11_COLOR_WRITE_ENABLE_BLUE);
+            }
+
             // Render the eyes
             if (singleEye) {
                 if (showLeft && leftSRV) {
-                    blitTexture(leftSRV, fullVp);
+                    blitTexture(leftSRV, fullVp, leftBlend);
                 } else if (showRight && rightSRV) {
-                    blitTexture(rightSRV, fullVp);
+                    blitTexture(rightSRV, fullVp, rightBlend);
                 }
             } else {
                 // Side by side (or over/under)
                 if (showLeft && leftSRV) {
-                    blitTexture(leftSRV, leftVp);
+                    blitTexture(leftSRV, leftVp, leftBlend);
                 }
                 if (showRight && rightSRV) {
-                    blitTexture(rightSRV, rightVp);
+                    blitTexture(rightSRV, rightVp, rightBlend);
                 } else if (showRight && leftSRV) {
                     // Mirror left eye if no right eye available
-                    blitTexture(leftSRV, rightVp);
+                    blitTexture(leftSRV, rightVp, rightBlend);
                 }
             }
 
@@ -6769,11 +6796,17 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
                     }
                 }
 
-                ID3D11BlendState* leftBlend = nullptr;
-                ID3D11BlendState* rightBlend = nullptr;
+                const UINT8 rgbMask = D3D11_COLOR_WRITE_ENABLE_RED |
+                                      D3D11_COLOR_WRITE_ENABLE_GREEN |
+                                      D3D11_COLOR_WRITE_ENABLE_BLUE;
+                ID3D11BlendState* leftBlend = rt::GetLayerBlendState(s, blendMode, rgbMask);
+                ID3D11BlendState* rightBlend = leftBlend;
                 if (!singleEye && layout == ui::DisplayLayout::Anaglyph) {
-                    leftBlend = s.anaglyphRedBS.Get();
-                    rightBlend = s.anaglyphCyanBS.Get();
+                    leftBlend = rt::GetLayerBlendState(
+                        s, blendMode, D3D11_COLOR_WRITE_ENABLE_RED);
+                    rightBlend = rt::GetLayerBlendState(
+                        s, blendMode,
+                        D3D11_COLOR_WRITE_ENABLE_GREEN | D3D11_COLOR_WRITE_ENABLE_BLUE);
                 }
 
                 if (showLeft) {
@@ -6841,10 +6874,10 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
                 }
                 blitD3D12ToPreview(s, chL, leftIdx, vL.subImage.imageArrayIndex, rectL,
                                    &chR, rightIdx, vR.subImage.imageArrayIndex, rectR,
-                                   layout, viewMode);
+                                   layout, viewMode, blendMode);
             } else {
                 blitD3D12ToPreview(s, chL, leftIdx, vL.subImage.imageArrayIndex, rectL,
-                                   nullptr, 0, 0, rectL, layout, viewMode);
+                                   nullptr, 0, 0, rectL, layout, viewMode, blendMode);
             }
 
             // No Present call needed: the composite is shown by paintPreviewComposite once
@@ -6924,7 +6957,7 @@ static void renderQuadLayer(rt::Session& s, const XrCompositionLayerQuad* quad,
                                   (float)(qrect.x + qrect.w) / texW, (float)(qrect.y + qrect.h) / texH };
 
         D3D12_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-        srvDesc.Format = PreviewQuadSrvFormat(qd.Format);
+        srvDesc.Format = PreviewLinearSrvFormat(qd.Format, (DXGI_FORMAT)chain.format);
         srvDesc.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
         if (qd.DepthOrArraySize > 1) {
             srvDesc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;

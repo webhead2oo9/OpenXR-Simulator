@@ -11,6 +11,16 @@
 
 namespace composition_render {
 
+enum class LayerBlend { Opaque, Premultiplied, Unpremultiplied };
+
+inline LayerBlend BlendForLayerFlags(XrCompositionLayerFlags flags) {
+    if (!(flags & XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT)) {
+        return LayerBlend::Opaque;
+    }
+    return (flags & XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT)
+        ? LayerBlend::Unpremultiplied : LayerBlend::Premultiplied;
+}
+
 struct SubImageRect {
     uint32_t x{0};
     uint32_t y{0};
