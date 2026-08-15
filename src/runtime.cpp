@@ -120,6 +120,7 @@ static PFNGLCHECKFRAMEBUFFERSTATUSPROC g_glCheckFramebufferStatus = nullptr;
 #include "action_state.h"
 #include "interaction_query.h"
 #include "api_validation.h"
+#include "enum_strings.h"
 #include "composition_validation.h"
 #include "composition_render.h"
 #include "frame_state.h"
@@ -8972,16 +8973,22 @@ static XrResult XRAPI_PTR xrDestroySwapchain_runtime(XrSwapchain sc) {
 }
 
 // Missing functions Unity needs
-static XrResult XRAPI_PTR xrResultToString_runtime(XrInstance, XrResult value, char buffer[XR_MAX_RESULT_STRING_SIZE]) {
-    const char* str = "XR_SUCCESS";
-    if (value != XR_SUCCESS) str = "XR_ERROR";
-    strncpy(buffer, str, XR_MAX_RESULT_STRING_SIZE - 1);
-    buffer[XR_MAX_RESULT_STRING_SIZE - 1] = '\0';
+static XrResult XRAPI_PTR xrResultToString_runtime(
+    XrInstance instance, XrResult value, char buffer[XR_MAX_RESULT_STRING_SIZE]) {
+    if (!IsValidInstance(instance)) return XR_ERROR_HANDLE_INVALID;
+    if (!buffer) return XR_ERROR_VALIDATION_FAILURE;
+    const std::string name = enum_strings::Result(value);
+    std::snprintf(buffer, XR_MAX_RESULT_STRING_SIZE, "%s", name.c_str());
     return XR_SUCCESS;
 }
 
-static XrResult XRAPI_PTR xrStructureTypeToString_runtime(XrInstance, XrStructureType value, char buffer[XR_MAX_STRUCTURE_NAME_SIZE]) {
-    snprintf(buffer, XR_MAX_STRUCTURE_NAME_SIZE, "XrStructureType_%d", (int)value);
+static XrResult XRAPI_PTR xrStructureTypeToString_runtime(
+    XrInstance instance, XrStructureType value,
+    char buffer[XR_MAX_STRUCTURE_NAME_SIZE]) {
+    if (!IsValidInstance(instance)) return XR_ERROR_HANDLE_INVALID;
+    if (!buffer) return XR_ERROR_VALIDATION_FAILURE;
+    const std::string name = enum_strings::StructureType(value);
+    std::snprintf(buffer, XR_MAX_STRUCTURE_NAME_SIZE, "%s", name.c_str());
     return XR_SUCCESS;
 }
 

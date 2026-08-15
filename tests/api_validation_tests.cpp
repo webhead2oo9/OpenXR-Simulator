@@ -1,4 +1,5 @@
 #include "api_validation.h"
+#include "enum_strings.h"
 
 #include <cstdio>
 
@@ -55,6 +56,27 @@ int main() {
     Check(api_validation::ValidateOutputStruct(&view, XR_TYPE_VIEW_CONFIGURATION_VIEW) ==
               XR_ERROR_VALIDATION_FAILURE,
           "an output struct with the wrong type is rejected");
+
+    Check(enum_strings::Result(XR_ERROR_SESSION_NOT_RUNNING) ==
+              "XR_ERROR_SESSION_NOT_RUNNING",
+          "a known result uses its exact OpenXR token");
+    Check(enum_strings::Result(XR_ERROR_MARKER_DETECTOR_PERMISSION_DENIED_ML) ==
+              "XR_ERROR_MARKER_DETECTOR_PERMISSION_DENIED_ML",
+          "a result added by OpenXR 1.0.34 is recognized");
+    Check(enum_strings::Result(static_cast<XrResult>(12345)) ==
+              "XR_UNKNOWN_SUCCESS_12345",
+          "an unknown positive result uses the required success form");
+    Check(enum_strings::Result(static_cast<XrResult>(-12345)) ==
+              "XR_UNKNOWN_FAILURE_-12345",
+          "an unknown negative result uses the required failure form");
+    Check(enum_strings::StructureType(XR_TYPE_FRAME_STATE) == "XR_TYPE_FRAME_STATE",
+          "a known structure type uses its exact OpenXR token");
+    Check(enum_strings::StructureType(XR_TYPE_SYSTEM_MARKER_UNDERSTANDING_PROPERTIES_ML) ==
+              "XR_TYPE_SYSTEM_MARKER_UNDERSTANDING_PROPERTIES_ML",
+          "a structure type added by OpenXR 1.0.34 is recognized");
+    Check(enum_strings::StructureType(static_cast<XrStructureType>(12345)) ==
+              "XR_UNKNOWN_STRUCTURE_TYPE_12345",
+          "an unknown structure type includes its decimal value");
 
     if (failures) return 1;
     std::puts("API validation tests passed");
