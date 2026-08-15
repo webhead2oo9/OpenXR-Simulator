@@ -125,6 +125,7 @@ static PFNGLCHECKFRAMEBUFFERSTATUSPROC g_glCheckFramebufferStatus = nullptr;
 #include "composition_render.h"
 #include "frame_state.h"
 #include "pose_math.h"
+#include "preview_focus.h"
 #include "projection_timing.h"
 #include "swapchain_state.h"
 #include "ui_enhancements.h"
@@ -534,7 +535,7 @@ struct Session {
 
     // Desktop preview window (no thread - handled on main thread)
     HWND hwnd{nullptr};
-    std::atomic<bool> isFocused{false};
+    std::atomic<bool> previewInputFocused{false};
     ComPtr<IDXGISwapChain1> previewSwapchain;
     UINT previewWidth{1920};
     UINT previewHeight{540};
@@ -1501,29 +1502,27 @@ static LRESULT CALLBACK WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lPara
             // PostQuitMessage would tell the host application to exit.
             Log("[SimXR] WndProc: WM_DESTROY received");
             return 0;
-        case WM_ACTIVATE:
-            if (LOWORD(wParam) != WA_INACTIVE) {
-                rt::g_session.isFocused = true;
-                Log("[SimXR] WndProc: WM_ACTIVATE -> focused");
-                // Push FOCUSED state if we were VISIBLE
-                if (rt::g_session.state == XR_SESSION_STATE_VISIBLE) {
-                    rt::PushState(rt::g_session.handle, XR_SESSION_STATE_FOCUSED);
-                }
-            } else {
-                rt::g_session.isFocused = false;
-                Log("[SimXR] WndProc: WM_ACTIVATE -> unfocused");
-                rt::g_mouseCapture = false;  // Release mouse capture when window loses focus
+        case WM_ACTIVATE: {
+            const bool active = LOWORD(wParam) != WA_INACTIVE;
+            const preview_focus::ActivationEffects effects =
+                preview_focus::OnActivation(active, rt::g_session.state);
+            rt::g_session.previewInputFocused = effects.inputFocused;
+            Log(active
+                ? "[SimXR] WndProc: preview input focused"
+                : "[SimXR] WndProc: preview input unfocused");
+            if (effects.releaseMouseCapture) {
+                rt::g_mouseCapture = false;
                 rt::g_panDrag = false;
                 ReleaseCapture();
-                // Push VISIBLE state if we were FOCUSED
-                if (rt::g_session.state == XR_SESSION_STATE_FOCUSED) {
-                    rt::PushState(rt::g_session.handle, XR_SESSION_STATE_VISIBLE);
-                }
+            }
+            if (effects.sessionState != rt::g_session.state) {
+                rt::PushState(rt::g_session.handle, effects.sessionState);
             }
             return 0;
+        }
         case WM_LBUTTONDOWN:
-            Logf("[SimXR] WM_LBUTTONDOWN: focused=%d", rt::g_session.isFocused.load());
-            if (rt::g_session.isFocused) {
+            Logf("[SimXR] WM_LBUTTONDOWN: focused=%d", rt::g_session.previewInputFocused.load());
+            if (rt::g_session.previewInputFocused) {
                 rt::g_mouseCapture = true;
                 SetCapture(hWnd);
                 GetCursorPos(&rt::g_lastMousePos);
@@ -1833,21 +1832,21 @@ static void ensurePreview(Session& s) {
     if (s.hwnd) return;
     WNDCLASSW wc{}; wc.lpfnWndProc = WndProc; wc.hInstance = GetModuleHandleW(nullptr); wc.lpszClassName = L"OpenXR Simulator";
     RegisterClassW(&wc);
-    s.hwnd = CreateWindowExW(0, wc.lpszClassName, L"OpenXR Simulator", WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+    s.hwnd = CreateWindowExW(0, wc.lpszClassName, L"OpenXR Simulator", WS_OVERLAPPEDWINDOW,
                              CW_USEDEFAULT, CW_USEDEFAULT, (int)s.previewWidth, (int)s.previewHeight, nullptr, nullptr, wc.hInstance, nullptr);
     Logf("[SimXR] ensurePreview: hwnd=%p size=%ux%u usesD3D12=%d", s.hwnd, s.previewWidth, s.previewHeight, s.usesD3D12);
 
     // Make sure window is shown and updated
     if (s.hwnd) {
-        ShowWindow(s.hwnd, SW_SHOW);
+        ShowWindow(s.hwnd, SW_SHOWNOACTIVATE);
         UpdateWindow(s.hwnd);
 
         // Check if window has focus
         if (GetForegroundWindow() == s.hwnd) {
-            s.isFocused = true;
+            s.previewInputFocused = true;
             Log("[SimXR] Window created with focus");
         } else {
-            s.isFocused = false;
+            s.previewInputFocused = false;
             Log("[SimXR] Window created without focus");
         }
     }
@@ -3388,7 +3387,7 @@ static XrResult XRAPI_PTR xrDestroySession_runtime(XrSession s) {
     rt::g_session.hwnd = nullptr;  // Clear from session but window still exists
     rt::g_session.previewWidth = 1920;
     rt::g_session.previewHeight = 540;
-    rt::g_session.isFocused = false;
+    rt::g_session.previewInputFocused = false;
     rt::g_activeProfile = XR_NULL_PATH;  // re-bound by the next xrAttachSessionActionSets
     rt::g_attachedActionSets.clear();
     rt::g_activeActionSetSources.clear();
@@ -4321,12 +4320,10 @@ static XrResult XRAPI_PTR xrBeginSession_runtime(XrSession s, const XrSessionBeg
 
     rt::PushState(s, XR_SESSION_STATE_SYNCHRONIZED); 
     rt::PushState(s, XR_SESSION_STATE_VISIBLE);
-    // A simulator has no physical HMD focus hand-off. The preview window is created
-    // lazily by xrWaitFrame, while several clients (including BetterVR) wait for
-    // FOCUSED before entering their frame loop. Conditioning FOCUSED on that not-yet-
-    // created window deadlocks a clean launch. Report input focus immediately; the
-    // window activation handler may still move between VISIBLE/FOCUSED later.
-    rt::g_session.isFocused = true;
+    // A simulator has no physical HMD focus hand-off. Keep the OpenXR application
+    // focused for the running session; activation of the runtime-owned diagnostic
+    // preview controls only its mouse/keyboard input and must not perturb the app's
+    // lifecycle or make its renderer behave as a background window.
     rt::PushState(s, XR_SESSION_STATE_FOCUSED);
     return XR_SUCCESS; 
 }
@@ -4391,8 +4388,8 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession session, const XrFrameWa
     // different PID.
     //
     // WHY THIS MATTERS (6DOF translation bug): previously this required `foreground == preview &&
-    // isFocused`. As soon as the game's window took the foreground (which it does on launch / when
-    // fullscreen), the preview went inactive (isFocused=false) and WASD silently stopped feeding
+    // previewInputFocused`. As soon as the game's window took the foreground (which it does on launch /
+    // when fullscreen), the preview went inactive and WASD silently stopped feeding
     // g_headPos — so interactive head translation looked completely dead, even though the underlying
     // pose pipeline was fine (scripted head_pose_command.json poses are focus-independent, which is
     // exactly why those worked while WASD didn't). Gating on "any window of our process is foreground"
@@ -4402,7 +4399,7 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession session, const XrFrameWa
     bool previewWindowFocused = false;
     if (foregroundWindow != nullptr) {
         if (foregroundWindow == rt::g_session.hwnd) {
-            previewWindowFocused = rt::g_session.isFocused.load();
+            previewWindowFocused = rt::g_session.previewInputFocused.load();
         } else {
             DWORD fgPid = 0;
             GetWindowThreadProcessId(foregroundWindow, &fgPid);
@@ -4841,7 +4838,7 @@ static void ensurePreviewWindow(rt::Session& s, UINT initialClientW, UINT initia
             SetWindowLongPtrW(s.hwnd, GWLP_WNDPROC, (LONG_PTR)rt::WndProc);
             Log("[SimXR] Updated window WndProc to new DLL address");
             ui::ApplyDarkTheme(s.hwnd);
-            ShowWindow(s.hwnd, SW_SHOW);
+            ShowWindow(s.hwnd, SW_SHOWNOACTIVATE);
             UpdateWindow(s.hwnd);
             // Seed clientWidth/Height from the actual current client area
             RECT cr{};
@@ -4866,10 +4863,12 @@ static void ensurePreviewWindow(rt::Session& s, UINT initialClientW, UINT initia
         Log("[SimXR] Failed to create preview window!");
         return;
     }
-    ShowWindow(s.hwnd, SW_SHOW);
+    // The preview is diagnostic runtime UI. Showing it must not background the
+    // OpenXR application and stall Unity's world rendering.
+    ShowWindow(s.hwnd, SW_SHOWNOACTIVATE);
     UpdateWindow(s.hwnd);
-    SetForegroundWindow(s.hwnd);
-    SetWindowPos(s.hwnd, HWND_TOP, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW);
+    SetWindowPos(s.hwnd, HWND_TOP, 0, 0, 0, 0,
+                 SWP_NOMOVE | SWP_NOSIZE | SWP_SHOWWINDOW | SWP_NOACTIVATE);
     Logf("[SimXR] Created new preview window: hwnd=%p clientSize=%ux%u",
          s.hwnd, initialClientW, initialClientH);
 

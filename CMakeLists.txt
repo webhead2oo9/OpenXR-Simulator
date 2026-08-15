@@ -41,6 +41,7 @@ add_library(openxr_simulator SHARED
     src/json.h
     src/mcp_integration.h
     src/projection_timing.h
+    src/preview_focus.h
     src/ui_enhancements.h
 )
 
@@ -72,6 +73,10 @@ if(BUILD_TESTING)
     add_executable(frame_state_tests tests/frame_state_tests.cpp)
     target_include_directories(frame_state_tests PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/include)
     add_test(NAME frame_state COMMAND frame_state_tests)
+    add_executable(preview_focus_tests tests/preview_focus_tests.cpp)
+    target_include_directories(preview_focus_tests PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/include)
+    add_test(NAME preview_focus COMMAND preview_focus_tests)
+
 
     add_executable(composition_validation_tests tests/composition_validation_tests.cpp)
     target_include_directories(composition_validation_tests PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/include)
