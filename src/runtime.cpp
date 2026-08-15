@@ -2557,6 +2557,14 @@ static void FrameSyncEnd(rt::Session& s) {
 
 static constexpr XrVersion kRuntimeApiVersion = XR_MAKE_VERSION(1, 0, 34);
 
+static bool IsValidInstance(XrInstance instance) {
+    return instance != XR_NULL_HANDLE && instance == rt::g_instance.handle;
+}
+
+static bool IsValidSystem(XrSystemId systemId) {
+    return systemId == (XrSystemId)1;
+}
+
 static XrResult XRAPI_PTR xrGetInstanceProcAddr_runtime(XrInstance, const char* name, PFN_xrVoidFunction* fn);
 
 extern "C" __declspec(dllexport) XrResult XRAPI_CALL xrNegotiateLoaderRuntimeInterface(const XrNegotiateLoaderInfo* loaderInfo,
@@ -2603,11 +2611,11 @@ static XrResult XRAPI_PTR xrGetD3D12GraphicsRequirementsKHR_runtime(
     XrInstance instance, XrSystemId systemId, XrGraphicsRequirementsD3D12KHR* req) {
     Logf("[SimXR] xrGetD3D12GraphicsRequirementsKHR called: instance=%p, systemId=%llu, req=%p",
          instance, (unsigned long long)systemId, req);
-    if (!req) return XR_ERROR_VALIDATION_FAILURE;
-
-    memset(req, 0, sizeof(*req));
-    req->type = XR_TYPE_GRAPHICS_REQUIREMENTS_D3D12_KHR;
-    req->next = nullptr;
+    if (!IsValidInstance(instance)) return XR_ERROR_HANDLE_INVALID;
+    if (!IsValidSystem(systemId)) return XR_ERROR_SYSTEM_INVALID;
+    if (!req || req->type != XR_TYPE_GRAPHICS_REQUIREMENTS_D3D12_KHR) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
 
     Microsoft::WRL::ComPtr<IDXGIFactory1> f;
     HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(f.GetAddressOf()));
@@ -2630,7 +2638,9 @@ static XrResult XRAPI_PTR xrGetD3D11GraphicsRequirementsKHR_runtime(
     XrInstance instance, XrSystemId systemId, XrGraphicsRequirementsD3D11KHR* req) {
     Logf("[SimXR] xrGetD3D11GraphicsRequirementsKHR called: instance=%p, systemId=%llu, req=%p",
          instance, (unsigned long long)systemId, req);
-    if (!req) {
+    if (!IsValidInstance(instance)) return XR_ERROR_HANDLE_INVALID;
+    if (!IsValidSystem(systemId)) return XR_ERROR_SYSTEM_INVALID;
+    if (!req || req->type != XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR) {
         Log("[SimXR] xrGetD3D11GraphicsRequirementsKHR: ERROR - null req");
         return XR_ERROR_VALIDATION_FAILURE;
     }
@@ -2642,11 +2652,6 @@ static XrResult XRAPI_PTR xrGetD3D11GraphicsRequirementsKHR_runtime(
     if (req->type != 0) {
         Logf("[SimXR] xrGetD3D11GraphicsRequirementsKHR: req->type already set to %d", req->type);
     }
-    
-    // Zero initialize the entire structure first
-    memset(req, 0, sizeof(XrGraphicsRequirementsD3D11KHR));
-    req->type = XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR;
-    req->next = nullptr;
     
     Microsoft::WRL::ComPtr<IDXGIFactory1> f;
     HRESULT hr = CreateDXGIFactory1(IID_PPV_ARGS(f.GetAddressOf()));
@@ -2723,15 +2728,12 @@ static XrResult XRAPI_PTR xrGetOpenGLGraphicsRequirementsKHR_runtime(
     XrInstance instance, XrSystemId systemId, XrGraphicsRequirementsOpenGLKHR* req) {
     Logf("[SimXR] xrGetOpenGLGraphicsRequirementsKHR called: instance=%p, systemId=%llu, req=%p",
          instance, (unsigned long long)systemId, req);
-    if (!req) {
+    if (!IsValidInstance(instance)) return XR_ERROR_HANDLE_INVALID;
+    if (!IsValidSystem(systemId)) return XR_ERROR_SYSTEM_INVALID;
+    if (!req || req->type != XR_TYPE_GRAPHICS_REQUIREMENTS_OPENGL_KHR) {
         Log("[SimXR] xrGetOpenGLGraphicsRequirementsKHR: ERROR - null req");
         return XR_ERROR_VALIDATION_FAILURE;
     }
-
-    // Zero initialize the structure
-    memset(req, 0, sizeof(XrGraphicsRequirementsOpenGLKHR));
-    req->type = XR_TYPE_GRAPHICS_REQUIREMENTS_OPENGL_KHR;
-    req->next = nullptr;
 
     // Minimum OpenGL version: 4.0.0 (good compatibility)
     // Maximum: 4.6.0 (latest)
@@ -2755,10 +2757,12 @@ static XrResult XRAPI_PTR xrGetOpenGLGraphicsRequirementsKHR_runtime(
 // XrGraphicsRequirementsVulkan2KHR is a typedef of the v1 struct, so one implementation
 // serves both extensions.
 static XrResult XRAPI_PTR xrGetVulkanGraphicsRequirementsKHR_runtime(
-    XrInstance, XrSystemId, XrGraphicsRequirementsVulkanKHR* req) {
-    if (!req) return XR_ERROR_VALIDATION_FAILURE;
-    memset(req, 0, sizeof(*req));
-    req->type = XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR;
+    XrInstance instance, XrSystemId systemId, XrGraphicsRequirementsVulkanKHR* req) {
+    if (!IsValidInstance(instance)) return XR_ERROR_HANDLE_INVALID;
+    if (!IsValidSystem(systemId)) return XR_ERROR_SYSTEM_INVALID;
+    if (!req || req->type != XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
     req->minApiVersionSupported = XR_MAKE_VERSION(1, 0, 0);
     req->maxApiVersionSupported = XR_MAKE_VERSION(1, 4, 0);
     Log("[SimXR] xrGetVulkanGraphicsRequirementsKHR: Vulkan 1.0 - 1.4");
@@ -3044,10 +3048,9 @@ static XrResult XRAPI_PTR xrDestroyInstance_runtime(XrInstance instance) {
     return XR_SUCCESS;
 }
 
-static XrResult XRAPI_PTR xrGetInstanceProperties_runtime(XrInstance, XrInstanceProperties* props) {
-    if (!props) return XR_ERROR_VALIDATION_FAILURE;
-    props->type = XR_TYPE_INSTANCE_PROPERTIES;
-    props->next = nullptr;
+static XrResult XRAPI_PTR xrGetInstanceProperties_runtime(XrInstance instance, XrInstanceProperties* props) {
+    if (!IsValidInstance(instance)) return XR_ERROR_HANDLE_INVALID;
+    if (!props || props->type != XR_TYPE_INSTANCE_PROPERTIES) return XR_ERROR_VALIDATION_FAILURE;
     props->runtimeVersion = kRuntimeApiVersion;
     strncpy(props->runtimeName, "OpenXR Simulator Runtime", XR_MAX_RUNTIME_NAME_SIZE - 1);
     props->runtimeName[XR_MAX_RUNTIME_NAME_SIZE - 1] = '\0';
@@ -3055,8 +3058,9 @@ static XrResult XRAPI_PTR xrGetInstanceProperties_runtime(XrInstance, XrInstance
     return XR_SUCCESS;
 }
 
-static XrResult XRAPI_PTR xrGetSystem_runtime(XrInstance, const XrSystemGetInfo* info, XrSystemId* systemId) {
-    if (!info || !systemId) return XR_ERROR_VALIDATION_FAILURE;
+static XrResult XRAPI_PTR xrGetSystem_runtime(XrInstance instance, const XrSystemGetInfo* info, XrSystemId* systemId) {
+    if (!IsValidInstance(instance)) return XR_ERROR_HANDLE_INVALID;
+    if (!info || info->type != XR_TYPE_SYSTEM_GET_INFO || !systemId) return XR_ERROR_VALIDATION_FAILURE;
     Logf("[SimXR] xrGetSystem: formFactor=%d", info->formFactor);
     if (info->formFactor != XR_FORM_FACTOR_HEAD_MOUNTED_DISPLAY) {
         Log("[SimXR] xrGetSystem: ERROR - form factor not HMD");
@@ -3067,10 +3071,10 @@ static XrResult XRAPI_PTR xrGetSystem_runtime(XrInstance, const XrSystemGetInfo*
     return XR_SUCCESS;
 }
 
-static XrResult XRAPI_PTR xrGetSystemProperties_runtime(XrInstance, XrSystemId, XrSystemProperties* props) {
-    if (!props) return XR_ERROR_VALIDATION_FAILURE;
-    props->type = XR_TYPE_SYSTEM_PROPERTIES;
-    props->next = nullptr;
+static XrResult XRAPI_PTR xrGetSystemProperties_runtime(XrInstance instance, XrSystemId systemId, XrSystemProperties* props) {
+    if (!IsValidInstance(instance)) return XR_ERROR_HANDLE_INVALID;
+    if (!IsValidSystem(systemId)) return XR_ERROR_SYSTEM_INVALID;
+    if (!props || props->type != XR_TYPE_SYSTEM_PROPERTIES) return XR_ERROR_VALIDATION_FAILURE;
     strncpy(props->systemName, "OpenXR Simulator", XR_MAX_SYSTEM_NAME_SIZE - 1);
     props->systemName[XR_MAX_SYSTEM_NAME_SIZE - 1] = '\0';
     props->systemId = 1;
@@ -3084,7 +3088,9 @@ static XrResult XRAPI_PTR xrGetSystemProperties_runtime(XrInstance, XrSystemId, 
     return XR_SUCCESS;
 }
 
-static XrResult XRAPI_PTR xrEnumerateViewConfigurations_runtime(XrInstance, XrSystemId, uint32_t capacity, uint32_t* count, XrViewConfigurationType* types) {
+static XrResult XRAPI_PTR xrEnumerateViewConfigurations_runtime(XrInstance instance, XrSystemId systemId, uint32_t capacity, uint32_t* count, XrViewConfigurationType* types) {
+    if (!IsValidInstance(instance)) return XR_ERROR_HANDLE_INVALID;
+    if (!IsValidSystem(systemId)) return XR_ERROR_SYSTEM_INVALID;
     Logf("[SimXR] xrEnumerateViewConfigurations called: capacity=%u", capacity);
     const XrResult validation = api_validation::ValidateEnumeration(capacity, count, types, 1);
     if (XR_FAILED(validation) || capacity == 0) return validation;
@@ -3093,7 +3099,9 @@ static XrResult XRAPI_PTR xrEnumerateViewConfigurations_runtime(XrInstance, XrSy
     return XR_SUCCESS;
 }
 
-static XrResult XRAPI_PTR xrEnumerateViewConfigurationViews_runtime(XrInstance, XrSystemId, XrViewConfigurationType viewType, uint32_t capacity, uint32_t* count, XrViewConfigurationView* views) {
+static XrResult XRAPI_PTR xrEnumerateViewConfigurationViews_runtime(XrInstance instance, XrSystemId systemId, XrViewConfigurationType viewType, uint32_t capacity, uint32_t* count, XrViewConfigurationView* views) {
+    if (!IsValidInstance(instance)) return XR_ERROR_HANDLE_INVALID;
+    if (!IsValidSystem(systemId)) return XR_ERROR_SYSTEM_INVALID;
     Logf("[SimXR] xrEnumerateViewConfigurationViews called: viewType=%d, capacity=%u", (int)viewType, capacity);
     if (viewType != XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO) {
         return XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED;
@@ -3120,8 +3128,10 @@ static XrResult XRAPI_PTR xrEnumerateViewConfigurationViews_runtime(XrInstance, 
 }
 
 static XrResult XRAPI_PTR xrEnumerateEnvironmentBlendModes_runtime(
-    XrInstance, XrSystemId, XrViewConfigurationType viewType, uint32_t capacity,
+    XrInstance instance, XrSystemId systemId, XrViewConfigurationType viewType, uint32_t capacity,
     uint32_t* count, XrEnvironmentBlendMode* modes) {
+    if (!IsValidInstance(instance)) return XR_ERROR_HANDLE_INVALID;
+    if (!IsValidSystem(systemId)) return XR_ERROR_SYSTEM_INVALID;
     if (viewType != XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO) {
         return XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED;
     }
@@ -8010,6 +8020,8 @@ static XrResult XRAPI_PTR xrLocateViews_runtime(XrSession session, const XrViewL
     rt::GetEffectiveHeadAngles(effYaw, effPitch, effRoll);
     for (uint32_t i = 0; i < 2; ++i) {
         if (views[i].type != XR_TYPE_VIEW) return XR_ERROR_VALIDATION_FAILURE;
+    }
+    for (uint32_t i = 0; i < 2; ++i) {
         const XrPosef eyeWorld = rt::ViewPoseFromAngles(i, effYaw, effPitch, effRoll);
         views[i].pose = pose_math::Relative(eyeWorld, baseWorld);
         views[i].fov = rt::GetViewFov(i);
@@ -8833,10 +8845,16 @@ static XrResult XRAPI_PTR xrGetReferenceSpaceBoundsRect_runtime(XrSession, XrRef
     return XR_SUCCESS;
 }
 
-static XrResult XRAPI_PTR xrGetViewConfigurationProperties_runtime(XrInstance, XrSystemId, XrViewConfigurationType type, 
+static XrResult XRAPI_PTR xrGetViewConfigurationProperties_runtime(XrInstance instance, XrSystemId systemId, XrViewConfigurationType type,
                                                                    XrViewConfigurationProperties* props) {
-    if (!props) return XR_ERROR_VALIDATION_FAILURE;
-    props->type = XR_TYPE_VIEW_CONFIGURATION_PROPERTIES;
+    if (!IsValidInstance(instance)) return XR_ERROR_HANDLE_INVALID;
+    if (!IsValidSystem(systemId)) return XR_ERROR_SYSTEM_INVALID;
+    if (type != XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO) {
+        return XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED;
+    }
+    if (!props || props->type != XR_TYPE_VIEW_CONFIGURATION_PROPERTIES) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
     props->viewConfigurationType = type;
     props->fovMutable = XR_FALSE;
     Log("[SimXR] xrGetViewConfigurationProperties");
