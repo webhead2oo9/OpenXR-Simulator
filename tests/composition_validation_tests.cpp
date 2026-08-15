@@ -1,5 +1,6 @@
 #include "composition_validation.h"
 
+#include <cmath>
 #include <cstdio>
 
 namespace {
@@ -23,6 +24,17 @@ XrSwapchainSubImage SubImage(int32_t x, int32_t y, int32_t width, int32_t height
 } // namespace
 
 int main() {
+    Check(composition_validation::IsValidFov({-0.8f, 0.9f, 0.7f, -0.6f}),
+          "a normal asymmetric field of view is valid");
+    Check(composition_validation::IsValidFov({0.8f, -0.8f, -0.7f, 0.7f}),
+          "reversed angles are valid and request axis flipping");
+    Check(!composition_validation::IsValidFov({-1.57079632679489661923f, 0.8f, 0.7f, -0.7f}),
+          "field-of-view angles exclude negative pi over two");
+    Check(!composition_validation::IsValidFov({-0.8f, 1.57079632679489661923f, 0.7f, -0.7f}),
+          "field-of-view angles exclude positive pi over two");
+    Check(!composition_validation::IsValidFov({-0.8f, 0.8f, NAN, -0.7f}),
+          "field-of-view angles must be finite");
+
     const composition_validation::SwapchainInfo valid{1024, 512, 2, 1, true};
     Check(composition_validation::ValidateSubImage(SubImage(0, 0, 1024, 512), valid) == XR_SUCCESS,
           "a full-image rectangle is valid");

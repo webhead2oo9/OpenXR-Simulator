@@ -7600,6 +7600,7 @@ static XrResult ValidateCompositionSubImage(const XrSwapchainSubImage& subImage)
 static XrResult ValidateProjectionView(const XrCompositionLayerProjectionView& view) {
     if (view.type != XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW) return XR_ERROR_VALIDATION_FAILURE;
     if (!pose_math::IsNormalized(view.pose.orientation)) return XR_ERROR_POSE_INVALID;
+    if (!composition_validation::IsValidFov(view.fov)) return XR_ERROR_VALIDATION_FAILURE;
     XrResult result = ValidateCompositionSubImage(view.subImage);
     if (XR_FAILED(result)) return result;
 

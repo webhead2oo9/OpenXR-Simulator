@@ -2,6 +2,7 @@
 
 #include <openxr/openxr.h>
 
+#include <cmath>
 #include <cstdint>
 
 namespace composition_validation {
@@ -13,6 +14,16 @@ struct SwapchainInfo {
     uint32_t faceCount{0};
     bool hasReleasedImage{false};
 };
+
+inline bool IsValidFov(const XrFovf& fov) {
+    constexpr float halfPi = 1.57079632679489661923f;
+    return std::isfinite(fov.angleLeft) && std::isfinite(fov.angleRight) &&
+           std::isfinite(fov.angleUp) && std::isfinite(fov.angleDown) &&
+           fov.angleLeft > -halfPi && fov.angleLeft < halfPi &&
+           fov.angleRight > -halfPi && fov.angleRight < halfPi &&
+           fov.angleUp > -halfPi && fov.angleUp < halfPi &&
+           fov.angleDown > -halfPi && fov.angleDown < halfPi;
+}
 
 inline XrResult ValidateSubImage(const XrSwapchainSubImage& subImage,
                                  const SwapchainInfo& swapchain) {
