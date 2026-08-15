@@ -7599,6 +7599,7 @@ static XrResult ValidateCompositionSubImage(const XrSwapchainSubImage& subImage)
 
 static XrResult ValidateProjectionView(const XrCompositionLayerProjectionView& view) {
     if (view.type != XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW) return XR_ERROR_VALIDATION_FAILURE;
+    if (!pose_math::IsNormalized(view.pose.orientation)) return XR_ERROR_POSE_INVALID;
     XrResult result = ValidateCompositionSubImage(view.subImage);
     if (XR_FAILED(result)) return result;
 
@@ -7655,6 +7656,9 @@ static XrResult ValidateFrameSubmission(const XrFrameEndInfo& info) {
             }
             case XR_TYPE_COMPOSITION_LAYER_QUAD: {
                 const auto* quad = reinterpret_cast<const XrCompositionLayerQuad*>(base);
+                if (!pose_math::IsNormalized(quad->pose.orientation)) {
+                    return XR_ERROR_POSE_INVALID;
+                }
                 if (quad->eyeVisibility != XR_EYE_VISIBILITY_BOTH &&
                     quad->eyeVisibility != XR_EYE_VISIBILITY_LEFT &&
                     quad->eyeVisibility != XR_EYE_VISIBILITY_RIGHT) {
@@ -7673,6 +7677,9 @@ static XrResult ValidateFrameSubmission(const XrFrameEndInfo& info) {
                     return XR_ERROR_LAYER_INVALID;
                 }
                 const auto* cylinder = reinterpret_cast<const XrCompositionLayerCylinderKHR*>(base);
+                if (!pose_math::IsNormalized(cylinder->pose.orientation)) {
+                    return XR_ERROR_POSE_INVALID;
+                }
                 if (cylinder->eyeVisibility != XR_EYE_VISIBILITY_BOTH &&
                     cylinder->eyeVisibility != XR_EYE_VISIBILITY_LEFT &&
                     cylinder->eyeVisibility != XR_EYE_VISIBILITY_RIGHT) {
