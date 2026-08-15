@@ -106,6 +106,19 @@ int main() {
           "all core top-level user paths are recognized");
     Check(!interaction_query::IsCoreTopLevelUserPath("/user/hand/left/input/trigger"),
           "an input component is not a top-level user path");
+    Check(interaction_query::ActionSourceMask("/user/head") ==
+              interaction_query::kHeadSource,
+          "head is a core action subaction path");
+    Check(interaction_query::ActionSourceMask("/user/gamepad") ==
+              interaction_query::kGamepadSource,
+          "gamepad is a core action subaction path");
+    Check(interaction_query::ActionSourceMask("/user/treadmill") == 0,
+          "treadmill is not a core action subaction path");
+    Check(interaction_query::ActionSlotForSourceMask(interaction_query::kGamepadSource) == 4,
+          "each core action source has a stable state slot");
+    Check(interaction_query::IsSimulatedHandSource(interaction_query::kLeftHandSource) &&
+              !interaction_query::IsSimulatedHandSource(interaction_query::kHeadSource),
+          "an unsimulated head pose cannot alias a hand controller");
     Check(interaction_query::ProfileSupportsTopLevel(
               "/interaction_profiles/oculus/touch_controller", "/user/hand/right"),
           "the Touch profile is active on hand paths");

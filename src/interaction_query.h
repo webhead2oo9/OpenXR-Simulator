@@ -8,6 +8,33 @@
 
 namespace interaction_query {
 
+constexpr int kLeftHandSource = 1;
+constexpr int kRightHandSource = 2;
+constexpr int kHeadSource = 4;
+constexpr int kGamepadSource = 8;
+constexpr int kAllActionSources =
+    kLeftHandSource | kRightHandSource | kHeadSource | kGamepadSource;
+
+inline int ActionSourceMask(const std::string& path) {
+    if (path == "/user/hand/left") return kLeftHandSource;
+    if (path == "/user/hand/right") return kRightHandSource;
+    if (path == "/user/head") return kHeadSource;
+    if (path == "/user/gamepad") return kGamepadSource;
+    return 0;
+}
+
+inline size_t ActionSlotForSourceMask(int sourceMask) {
+    if (sourceMask == kLeftHandSource) return 1;
+    if (sourceMask == kRightHandSource) return 2;
+    if (sourceMask == kHeadSource) return 3;
+    if (sourceMask == kGamepadSource) return 4;
+    return 0;
+}
+
+inline bool IsSimulatedHandSource(int sourceMask) {
+    return sourceMask == kLeftHandSource || sourceMask == kRightHandSource;
+}
+
 inline bool IsCoreTopLevelUserPath(const std::string& path) {
     return path == "/user/hand/left" || path == "/user/hand/right" ||
            path == "/user/head" || path == "/user/gamepad" ||
