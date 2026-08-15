@@ -2896,15 +2896,23 @@ static XrResult XRAPI_PTR xrCreateVulkanDeviceKHR_runtime(
 
 // --- Minimal implementations ---
 
-static const char* kSupportedExtensions[] = {
-    XR_KHR_D3D11_ENABLE_EXTENSION_NAME,
-    XR_KHR_D3D12_ENABLE_EXTENSION_NAME,
-    XR_KHR_OPENGL_ENABLE_EXTENSION_NAME,  // OpenGL support
-    XR_KHR_VULKAN_ENABLE_EXTENSION_NAME,
-    XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME,
-    XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME,
-    XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME,  // UEVR uses this for UI layers
-    "XR_KHR_win32_convert_performance_counter_time"    // Unity often requires this
+struct SupportedExtension {
+    const char* name;
+    uint32_t version;
+};
+
+static const SupportedExtension kSupportedExtensions[] = {
+    {XR_KHR_D3D11_ENABLE_EXTENSION_NAME, XR_KHR_D3D11_enable_SPEC_VERSION},
+    {XR_KHR_D3D12_ENABLE_EXTENSION_NAME, XR_KHR_D3D12_enable_SPEC_VERSION},
+    {XR_KHR_OPENGL_ENABLE_EXTENSION_NAME, XR_KHR_opengl_enable_SPEC_VERSION},
+    {XR_KHR_VULKAN_ENABLE_EXTENSION_NAME, XR_KHR_vulkan_enable_SPEC_VERSION},
+    {XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME, XR_KHR_vulkan_enable2_SPEC_VERSION},
+    {XR_KHR_COMPOSITION_LAYER_DEPTH_EXTENSION_NAME,
+     XR_KHR_composition_layer_depth_SPEC_VERSION},
+    {XR_KHR_COMPOSITION_LAYER_CYLINDER_EXTENSION_NAME,
+     XR_KHR_composition_layer_cylinder_SPEC_VERSION},
+    {XR_KHR_WIN32_CONVERT_PERFORMANCE_COUNTER_TIME_EXTENSION_NAME,
+     XR_KHR_win32_convert_performance_counter_time_SPEC_VERSION},
 };
 
 static XrResult XRAPI_PTR xrEnumerateApiLayerProperties_runtime(uint32_t propertyCapacityInput,
@@ -2918,7 +2926,7 @@ static XrResult XRAPI_PTR xrEnumerateApiLayerProperties_runtime(uint32_t propert
 static XrResult XRAPI_PTR xrEnumerateInstanceExtensionProperties_runtime(const char* layerName, uint32_t propertyCapacityInput,
                                                                          uint32_t* propertyCountOutput,
                                                                          XrExtensionProperties* properties) {
-    if (layerName && layerName[0] != '\0') return XR_ERROR_LAYER_INVALID;
+    if (layerName) return XR_ERROR_API_LAYER_NOT_PRESENT;
     const uint32_t count = (uint32_t)(sizeof(kSupportedExtensions)/sizeof(kSupportedExtensions[0]));
     const XrResult validation = api_validation::ValidateEnumeration(
         propertyCapacityInput, propertyCountOutput, properties, count);
@@ -2927,9 +2935,10 @@ static XrResult XRAPI_PTR xrEnumerateInstanceExtensionProperties_runtime(const c
         if (properties[i].type != XR_TYPE_EXTENSION_PROPERTIES) return XR_ERROR_VALIDATION_FAILURE;
     }
     for (uint32_t i = 0; i < count; ++i) {
-        std::strncpy(properties[i].extensionName, kSupportedExtensions[i], XR_MAX_EXTENSION_NAME_SIZE - 1);
+        std::strncpy(properties[i].extensionName, kSupportedExtensions[i].name,
+                     XR_MAX_EXTENSION_NAME_SIZE - 1);
         properties[i].extensionName[XR_MAX_EXTENSION_NAME_SIZE - 1] = '\0';
-        properties[i].extensionVersion = 1;
+        properties[i].extensionVersion = kSupportedExtensions[i].version;
         Logf("[SimXR] ext[%u]=%s", i, properties[i].extensionName);
     }
     return XR_SUCCESS;
@@ -2985,7 +2994,7 @@ static XrResult XRAPI_PTR xrCreateInstance_runtime(const XrInstanceCreateInfo* c
         }
         bool supported = false;
         for (uint32_t j = 0; j < supportedCount; ++j) {
-            if (strcmp(requested, kSupportedExtensions[j]) == 0) {
+            if (strcmp(requested, kSupportedExtensions[j].name) == 0) {
                 supported = true;
                 break;
             }
@@ -9306,7 +9315,7 @@ static const char* RequiredExtensionForCommand(const char* name) {
         return XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME;
     if (strcmp(name, "xrConvertWin32PerformanceCounterToTimeKHR") == 0 ||
         strcmp(name, "xrConvertTimeToWin32PerformanceCounterKHR") == 0)
-        return "XR_KHR_win32_convert_performance_counter_time";
+        return XR_KHR_WIN32_CONVERT_PERFORMANCE_COUNTER_TIME_EXTENSION_NAME;
     return nullptr;
 }
 
