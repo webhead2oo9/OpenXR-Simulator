@@ -55,4 +55,21 @@ inline SubImageRect ResolveSubImageRect(const XrRect2Di& rect, uint32_t textureW
             static_cast<uint32_t>(width), static_cast<uint32_t>(height)};
 }
 
+inline bool HasPixels(const XrRect2Di& rect) {
+    return rect.extent.width > 0 && rect.extent.height > 0;
+}
+
+inline bool HasPixels(const XrCompositionLayerProjection& projection) {
+    if (!projection.views) return false;
+    for (uint32_t view = 0; view < projection.viewCount; ++view) {
+        if (HasPixels(projection.views[view].subImage.imageRect)) return true;
+    }
+    return false;
+}
+
+inline bool HasPixels(const XrCompositionLayerQuad& quad) {
+    return quad.size.width > 0.0f && quad.size.height > 0.0f &&
+           HasPixels(quad.subImage.imageRect);
+}
+
 } // namespace composition_render

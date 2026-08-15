@@ -46,6 +46,25 @@ int main() {
     Check(clipped.x == 0 && clipped.y == 0 && clipped.w == 90 && clipped.h == 60,
           "defensive resolution clips malformed rectangles safely");
 
+    XrCompositionLayerProjectionView views[2]{};
+    views[0].subImage.imageRect = Rect(0, 0, 0, 512);
+    views[1].subImage.imageRect = Rect(0, 0, 1024, 512);
+    XrCompositionLayerProjection projection{};
+    projection.viewCount = 2;
+    projection.views = views;
+    Check(composition_render::HasPixels(projection),
+          "a projection contributes when either submitted view has pixels");
+    views[1].subImage.imageRect.extent.width = 0;
+    Check(!composition_render::HasPixels(projection),
+          "a projection with two empty views contributes no pixels");
+
+    XrCompositionLayerQuad quad{};
+    quad.subImage.imageRect = Rect(0, 0, 256, 256);
+    quad.size = {1.0f, 1.0f};
+    Check(composition_render::HasPixels(quad), "a positive-size quad contributes pixels");
+    quad.size.width = 0.0f;
+    Check(!composition_render::HasPixels(quad), "a zero-width quad contributes no pixels");
+
     if (failures) return 1;
     std::puts("composition render tests passed");
     return 0;

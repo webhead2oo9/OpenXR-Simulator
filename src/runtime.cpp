@@ -6101,7 +6101,8 @@ static void updatePreviewTitle(rt::Session& s) {
     ui::UpdateWindowTitle(s.hwnd, &si);
 }
 
-static void presentProjection(rt::Session& s, const XrCompositionLayerProjection& proj, bool skipPresent = false) {
+static void presentProjection(rt::Session& s, const XrCompositionLayerProjection& proj,
+                              bool skipPresent = false, bool clearTarget = true) {
     LogV("[SimXR] ============================================");
     LogVf("[SimXR] presentProjection called: viewCount=%u, skipPresent=%d", proj.viewCount, (int)skipPresent);
     LogV("[SimXR] RENDERING FRAME TO PREVIEW WINDOW");
@@ -6445,7 +6446,7 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
             ID3D11RenderTargetView* rtvs[1] = { rtv.Get() };
             s.d3d11Context->OMSetRenderTargets(1, rtvs, nullptr);
             const float clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-            s.d3d11Context->ClearRenderTargetView(rtv.Get(), clearColor);
+            if (clearTarget) s.d3d11Context->ClearRenderTargetView(rtv.Get(), clearColor);
 
             // Where the eyes land in the backbuffer (= client area). "Fit to Window"
             // scales the whole stereo image into it rather than cropping; any other
@@ -6616,7 +6617,7 @@ static void presentProjection(rt::Session& s, const XrCompositionLayerProjection
                 ID3D11RenderTargetView* rtvs[1] = { rtv.Get() };
                 s.d3d11Context->OMSetRenderTargets(1, rtvs, nullptr);
                 const float clearColor[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-                s.d3d11Context->ClearRenderTargetView(rtv.Get(), clearColor);
+                if (clearTarget) s.d3d11Context->ClearRenderTargetView(rtv.Get(), clearColor);
 
                 // Where the eyes land in the backbuffer (= client area), after zoom and pan.
                 // Single eye uses the rect whole; SBS / OverUnder split it; Anaglyph
@@ -7478,6 +7479,36 @@ static XrResult ValidateFrameSubmission(const XrFrameEndInfo& info) {
     return XR_SUCCESS;
 }
 
+static void RecordProjectionSubmission(const XrCompositionLayerProjection& projection,
+                                       uint64_t frame) {
+    if (projection.viewCount < 1 || !projection.views) return;
+
+    mcp::ProjLogEntry entry{};
+    entry.frame = frame;
+    entry.poseQx = projection.views[0].pose.orientation.x;
+    entry.poseQy = projection.views[0].pose.orientation.y;
+    entry.poseQz = projection.views[0].pose.orientation.z;
+    entry.poseQw = projection.views[0].pose.orientation.w;
+    entry.posX = projection.views[0].pose.position.x;
+    entry.posY = projection.views[0].pose.position.y;
+    entry.posZ = projection.views[0].pose.position.z;
+    const uint32_t count = (std::min)(projection.viewCount, 2u);
+    for (uint32_t view = 0; view < count; ++view) {
+        entry.aL[view] = projection.views[view].fov.angleLeft;
+        entry.aR[view] = projection.views[view].fov.angleRight;
+        entry.aU[view] = projection.views[view].fov.angleUp;
+        entry.aD[view] = projection.views[view].fov.angleDown;
+        entry.rectX[view] = projection.views[view].subImage.imageRect.offset.x;
+        entry.rectY[view] = projection.views[view].subImage.imageRect.offset.y;
+        entry.rectW[view] = projection.views[view].subImage.imageRect.extent.width;
+        entry.rectH[view] = projection.views[view].subImage.imageRect.extent.height;
+    }
+    mcp::g_projLog[mcp::g_projLogHead] = entry;
+    mcp::g_projLogHead = (mcp::g_projLogHead + 1) % mcp::PROJ_LOG_CAPACITY;
+    if (mcp::g_projLogCount < mcp::PROJ_LOG_CAPACITY) ++mcp::g_projLogCount;
+    mcp::g_lastProjEntry = entry;
+}
+
 static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession session, const XrFrameEndInfo* info) {
     if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
     if (!info || info->type != XR_TYPE_FRAME_END_INFO) return XR_ERROR_VALIDATION_FAILURE;
@@ -7569,7 +7600,7 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession session, const XrFrameEnd
         Logf("[SimXR] xrEndFrame: layers=%u", info->layerCount);
     }
 
-    // First pass: count layer types to know if we need to defer Present
+    // Count layer types for diagnostics and timing; rendering itself stays in submission order.
     int projectionCount = 0, quadCount = 0, cylinderCount = 0, otherCount = 0;
     bool hasStereoProjection = false;
     for (uint32_t i = 0; i < info->layerCount; ++i) {
@@ -7599,103 +7630,80 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession session, const XrFrameEnd
     flicker::ObserveSubmission((uint64_t)frameCount, (uint32_t)projectionCount,
                                info->layerCount);
 
-    // Determine if we need to defer Present for overlay layers
-    bool hasOverlays = (quadCount > 0 || cylinderCount > 0);
     g_presentPending = false;
 
-    // Second pass: render projection layers (background)
-    // If there are overlays, skip Present until after they're rendered
-    for (uint32_t i = 0; i < info->layerCount; ++i) {
-        const XrCompositionLayerBaseHeader* base = info->layers[i];
-        if (!base) continue;
+    bool compositionStarted = false;
+    bool projectionComposed = false;
+    LONGLONG projectionTicks = 0;
+    LONGLONG overlayTicks = 0;
 
-        if (base->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION) {
-            const auto* proj = reinterpret_cast<const XrCompositionLayerProjection*>(base);
-
-            // Capture the FOV+pose+rect the app is submitting into the
-            // projection log. MCP get_projection_log returns the recent
-            // window so the caller can diff "what app told the
-            // compositor" vs "what the simulator is configured to use."
-            if (proj->viewCount >= 1 && proj->views) {
-                mcp::ProjLogEntry e{};
-                e.frame   = frameCount;
-                e.poseQx  = proj->views[0].pose.orientation.x;
-                e.poseQy  = proj->views[0].pose.orientation.y;
-                e.poseQz  = proj->views[0].pose.orientation.z;
-                e.poseQw  = proj->views[0].pose.orientation.w;
-                e.posX    = proj->views[0].pose.position.x;
-                e.posY    = proj->views[0].pose.position.y;
-                e.posZ    = proj->views[0].pose.position.z;
-                uint32_t cap = (proj->viewCount >= 2) ? 2u : 1u;
-                for (uint32_t v = 0; v < cap; ++v) {
-                    e.aL[v] = proj->views[v].fov.angleLeft;
-                    e.aR[v] = proj->views[v].fov.angleRight;
-                    e.aU[v] = proj->views[v].fov.angleUp;
-                    e.aD[v] = proj->views[v].fov.angleDown;
-                    e.rectX[v] = proj->views[v].subImage.imageRect.offset.x;
-                    e.rectY[v] = proj->views[v].subImage.imageRect.offset.y;
-                    e.rectW[v] = proj->views[v].subImage.imageRect.extent.width;
-                    e.rectH[v] = proj->views[v].subImage.imageRect.extent.height;
-                }
-                mcp::g_projLog[mcp::g_projLogHead] = e;
-                mcp::g_projLogHead = (mcp::g_projLogHead + 1) % mcp::PROJ_LOG_CAPACITY;
-                if (mcp::g_projLogCount < mcp::PROJ_LOG_CAPACITY) ++mcp::g_projLogCount;
-                mcp::g_lastProjEntry = e;
-            }
-
-            presentProjection(rt::g_session, *proj, hasOverlays);  // skipPresent if overlays pending
-        }
-    }
-    LARGE_INTEGER afterProjection{};
-    QueryPerformanceCounter(&afterProjection);
-
-    // No projection layer this frame - the app is on a 2D-only screen. Bring the
-    // preview up ourselves (nothing else will) and clear it, so the overlay pass
-    // below has somewhere to composite instead of bailing out at its
-    // !previewSwapchain && !previewRT12 guard.
-    if (projectionCount == 0) {
+    // A quad can be the first pixel-producing layer even when an earlier projection has
+    // empty view rectangles. Give it a clean canvas without changing the submitted order.
+    const auto prepareOverlayCanvas = [&](bool anotherLayerWillDraw) {
         ensurePreviewWithoutProjection(rt::g_session);
-        if (!g_previewDueThisFrame) {
-            // Nothing paints this frame, so there is nothing to wipe either.
-        } else if (!rt::g_session.usesD3D12) {
+        if (!g_previewDueThisFrame) return;
+        if (!rt::g_session.usesD3D12) {
             clearPreviewToBlack(rt::g_session);
-        } else if (!hasOverlays) {
-            // D3D12 normally clears as part of opening the render target, which whichever
-            // layer pass runs first does - so the black and the layers over it reach the
-            // window in one repaint. A frame carrying no layers at all has no such pass,
-            // so open and close the target here to wipe the last 3D frame off the mirror.
+        } else if (!anotherLayerWillDraw) {
+            // A D3D12 layer opens and clears the target itself. An entirely empty frame
+            // has no layer pass, so open it here to replace the previous frame with black.
             if (rt::PreviewFrame12* slot = beginPreviewSlot(rt::g_session)) {
                 beginPreviewRT(rt::g_session, *slot);
             }
         }
-    }
+    };
 
-    // Third pass: render overlay layers (quad, cylinder) on top of the projection
+    // OpenXR uses a painter's algorithm: each layer is composited over all earlier array
+    // entries. Keep one traversal so a projection submitted after a quad actually remains
+    // above that quad, and defer the desktop Present until the traversal is complete.
     for (uint32_t i = 0; i < info->layerCount; ++i) {
         const XrCompositionLayerBaseHeader* base = info->layers[i];
-        if (!base) continue;
+        LARGE_INTEGER layerStart{}, layerFinish{};
+        QueryPerformanceCounter(&layerStart);
 
         switch (base->type) {
+            case XR_TYPE_COMPOSITION_LAYER_PROJECTION: {
+                const auto* projection =
+                    reinterpret_cast<const XrCompositionLayerProjection*>(base);
+                RecordProjectionSubmission(*projection, (uint64_t)frameCount);
+                if (composition_render::HasPixels(*projection)) {
+                    presentProjection(rt::g_session, *projection, true, !compositionStarted);
+                    compositionStarted = true;
+                    projectionComposed = true;
+                }
+                QueryPerformanceCounter(&layerFinish);
+                projectionTicks += layerFinish.QuadPart - layerStart.QuadPart;
+                break;
+            }
             case XR_TYPE_COMPOSITION_LAYER_QUAD: {
                 const auto* quad = reinterpret_cast<const XrCompositionLayerQuad*>(base);
-                renderQuadLayer(rt::g_session, quad);
+                if (composition_render::HasPixels(*quad)) {
+                    if (!compositionStarted) prepareOverlayCanvas(true);
+                    renderQuadLayer(rt::g_session, quad);
+                    compositionStarted = true;
+                }
+                QueryPerformanceCounter(&layerFinish);
+                overlayTicks += layerFinish.QuadPart - layerStart.QuadPart;
                 break;
             }
             case XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR: {
                 // TODO: Implement cylinder layer rendering
+                QueryPerformanceCounter(&layerFinish);
+                overlayTicks += layerFinish.QuadPart - layerStart.QuadPart;
                 break;
             }
             default:
                 break;
         }
     }
-    LARGE_INTEGER afterOverlays{};
-    QueryPerformanceCounter(&afterOverlays);
+    if (!compositionStarted) prepareOverlayCanvas(false);
+    LARGE_INTEGER afterLayers{};
+    QueryPerformanceCounter(&afterLayers);
 
     // Every layer of this frame has now been recorded, so hand the slot to the painter and
     // paint whichever earlier frame the GPU has finished in the meantime.
     if (rt::g_session.usesD3D12) {
-        closePreviewSlot(rt::g_session, (uint32_t)frameCount, projectionCount > 0);
+        closePreviewSlot(rt::g_session, (uint32_t)frameCount, projectionComposed);
         vkrt::FrameSyncEnd(rt::g_session);
         // Shows a finished composite if the GPU has produced one, and serves the
         // screenshot and burst requests off the very pixels it showed.
@@ -7784,9 +7792,9 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession session, const XrFrameEnd
         const auto elapsedMs = [&](const LARGE_INTEGER& begin, const LARGE_INTEGER& end) {
             return 1000.0 * (double)(end.QuadPart - begin.QuadPart) / (double)frequency.QuadPart;
         };
-        projectionMs += elapsedMs(endFrameStart, afterProjection);
-        overlayMs += elapsedMs(afterProjection, afterOverlays);
-        detectPaintMs += elapsedMs(afterOverlays, afterDetectionAndPaint);
+        projectionMs += 1000.0 * (double)projectionTicks / (double)frequency.QuadPart;
+        overlayMs += 1000.0 * (double)overlayTicks / (double)frequency.QuadPart;
+        detectPaintMs += elapsedMs(afterLayers, afterDetectionAndPaint);
         remainderMs += elapsedMs(afterDetectionAndPaint, endFrameFinish);
         totalMs += elapsedMs(endFrameStart, endFrameFinish);
         if (++timingFrames == 300) {
