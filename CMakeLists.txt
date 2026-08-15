@@ -80,6 +80,10 @@ if(BUILD_TESTING)
     add_executable(composition_render_tests tests/composition_render_tests.cpp)
     target_include_directories(composition_render_tests PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/include)
     add_test(NAME composition_render COMMAND composition_render_tests)
+
+    add_executable(api_validation_tests tests/api_validation_tests.cpp)
+    target_include_directories(api_validation_tests PRIVATE ${CMAKE_SOURCE_DIR}/src ${CMAKE_SOURCE_DIR}/include)
+    add_test(NAME api_validation COMMAND api_validation_tests)
 endif()
 
 # Link libraries

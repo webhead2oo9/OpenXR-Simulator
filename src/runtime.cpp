@@ -118,6 +118,7 @@ static PFNGLCHECKFRAMEBUFFERSTATUSPROC g_glCheckFramebufferStatus = nullptr;
 #include <loader_interfaces.h>
 #include "mcp_integration.h"
 #include "action_state.h"
+#include "api_validation.h"
 #include "composition_validation.h"
 #include "composition_render.h"
 #include "frame_state.h"
@@ -2764,9 +2765,9 @@ static XrResult XRAPI_PTR xrGetVulkanGraphicsRequirementsKHR_runtime(
 
 static XrResult CopyExtensionString(const std::string& s, uint32_t capacity, uint32_t* countOutput, char* buffer) {
     const uint32_t needed = (uint32_t)s.size() + 1;
-    if (countOutput) *countOutput = needed;
-    if (capacity == 0) return XR_SUCCESS;
-    if (capacity < needed || !buffer) return XR_ERROR_SIZE_INSUFFICIENT;
+    const XrResult validation =
+        api_validation::ValidateEnumeration(capacity, countOutput, buffer, needed);
+    if (XR_FAILED(validation) || capacity == 0) return validation;
     memcpy(buffer, s.c_str(), needed);
     return XR_SUCCESS;
 }
@@ -2892,24 +2893,25 @@ static XrResult XRAPI_PTR xrEnumerateApiLayerProperties_runtime(uint32_t propert
                                                                 XrApiLayerProperties* properties) {
     Log("[SimXR] xrEnumerateApiLayerProperties called");
     // Runtime doesn't provide API layers, only extensions
-    if (propertyCountOutput) *propertyCountOutput = 0;
-    return XR_SUCCESS;
+    return api_validation::ValidateEnumeration(
+        propertyCapacityInput, propertyCountOutput, properties, 0);
 }
 static XrResult XRAPI_PTR xrEnumerateInstanceExtensionProperties_runtime(const char* layerName, uint32_t propertyCapacityInput,
                                                                          uint32_t* propertyCountOutput,
                                                                          XrExtensionProperties* properties) {
     if (layerName && layerName[0] != '\0') return XR_ERROR_LAYER_INVALID;
     const uint32_t count = (uint32_t)(sizeof(kSupportedExtensions)/sizeof(kSupportedExtensions[0]));
-    if (propertyCountOutput) *propertyCountOutput = count;
-    if (properties && propertyCapacityInput) {
-        for (uint32_t i = 0; i < propertyCapacityInput && i < count; ++i) {
-            properties[i].type = XR_TYPE_EXTENSION_PROPERTIES;
-            properties[i].next = nullptr;
-            std::strncpy(properties[i].extensionName, kSupportedExtensions[i], XR_MAX_EXTENSION_NAME_SIZE - 1);
-            properties[i].extensionName[XR_MAX_EXTENSION_NAME_SIZE - 1] = '\0';
-            properties[i].extensionVersion = 1;
-            Logf("[SimXR] ext[%u]=%s", i, properties[i].extensionName);
-        }
+    const XrResult validation = api_validation::ValidateEnumeration(
+        propertyCapacityInput, propertyCountOutput, properties, count);
+    if (XR_FAILED(validation) || propertyCapacityInput == 0) return validation;
+    for (uint32_t i = 0; i < count; ++i) {
+        if (properties[i].type != XR_TYPE_EXTENSION_PROPERTIES) return XR_ERROR_VALIDATION_FAILURE;
+    }
+    for (uint32_t i = 0; i < count; ++i) {
+        std::strncpy(properties[i].extensionName, kSupportedExtensions[i], XR_MAX_EXTENSION_NAME_SIZE - 1);
+        properties[i].extensionName[XR_MAX_EXTENSION_NAME_SIZE - 1] = '\0';
+        properties[i].extensionVersion = 1;
+        Logf("[SimXR] ext[%u]=%s", i, properties[i].extensionName);
     }
     return XR_SUCCESS;
 }
@@ -3052,39 +3054,48 @@ static XrResult XRAPI_PTR xrGetSystemProperties_runtime(XrInstance, XrSystemId, 
 
 static XrResult XRAPI_PTR xrEnumerateViewConfigurations_runtime(XrInstance, XrSystemId, uint32_t capacity, uint32_t* count, XrViewConfigurationType* types) {
     Logf("[SimXR] xrEnumerateViewConfigurations called: capacity=%u", capacity);
-    if (count) *count = 1;
-    if (capacity >= 1 && types) {
-        types[0] = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
-        Log("[SimXR] xrEnumerateViewConfigurations: Returning PRIMARY_STEREO");
-    }
+    const XrResult validation = api_validation::ValidateEnumeration(capacity, count, types, 1);
+    if (XR_FAILED(validation) || capacity == 0) return validation;
+    types[0] = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+    Log("[SimXR] xrEnumerateViewConfigurations: Returning PRIMARY_STEREO");
     return XR_SUCCESS;
 }
 
 static XrResult XRAPI_PTR xrEnumerateViewConfigurationViews_runtime(XrInstance, XrSystemId, XrViewConfigurationType viewType, uint32_t capacity, uint32_t* count, XrViewConfigurationView* views) {
     Logf("[SimXR] xrEnumerateViewConfigurationViews called: viewType=%d, capacity=%u", (int)viewType, capacity);
-    if (count) *count = 2;
-    if (capacity >= 2 && views) {
-        for (uint32_t i = 0; i < 2; ++i) {
-            views[i].type = XR_TYPE_VIEW_CONFIGURATION_VIEW;
-            views[i].next = nullptr;
-            uint32_t renderW = 0, renderH = 0;
-            ui::GetRenderResolution(renderW, renderH);
-            views[i].recommendedImageRectWidth = renderW;
-            views[i].recommendedImageRectHeight = renderH;
-            views[i].recommendedSwapchainSampleCount = 1;
-            views[i].maxImageRectWidth = 4096; views[i].maxImageRectHeight = 4096; views[i].maxSwapchainSampleCount = 1;
-        }
-        Logf("[SimXR] xrEnumerateViewConfigurationViews: Returned 2 views (%ux%u recommended; headset geometry %s)",
-             views[0].recommendedImageRectWidth, views[0].recommendedImageRectHeight,
-             ui::HeadsetProfileName(ui::g_uiState.headsetProfile));
+    if (viewType != XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO) {
+        return XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED;
     }
+    const XrResult validation = api_validation::ValidateEnumeration(capacity, count, views, 2);
+    if (XR_FAILED(validation) || capacity == 0) return validation;
+    for (uint32_t i = 0; i < 2; ++i) {
+        if (views[i].type != XR_TYPE_VIEW_CONFIGURATION_VIEW) return XR_ERROR_VALIDATION_FAILURE;
+    }
+    for (uint32_t i = 0; i < 2; ++i) {
+        uint32_t renderW = 0, renderH = 0;
+        ui::GetRenderResolution(renderW, renderH);
+        views[i].recommendedImageRectWidth = renderW;
+        views[i].recommendedImageRectHeight = renderH;
+        views[i].recommendedSwapchainSampleCount = 1;
+        views[i].maxImageRectWidth = 4096;
+        views[i].maxImageRectHeight = 4096;
+        views[i].maxSwapchainSampleCount = 1;
+    }
+    Logf("[SimXR] xrEnumerateViewConfigurationViews: Returned 2 views (%ux%u recommended; headset geometry %s)",
+         views[0].recommendedImageRectWidth, views[0].recommendedImageRectHeight,
+         ui::HeadsetProfileName(ui::g_uiState.headsetProfile));
     return XR_SUCCESS;
 }
 
 static XrResult XRAPI_PTR xrEnumerateEnvironmentBlendModes_runtime(
-    XrInstance, XrSystemId, XrViewConfigurationType, uint32_t capacity, uint32_t* count, XrEnvironmentBlendMode* modes) {
-    if (count) *count = 1;
-    if (capacity >= 1 && modes) modes[0] = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+    XrInstance, XrSystemId, XrViewConfigurationType viewType, uint32_t capacity,
+    uint32_t* count, XrEnvironmentBlendMode* modes) {
+    if (viewType != XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO) {
+        return XR_ERROR_VIEW_CONFIGURATION_TYPE_UNSUPPORTED;
+    }
+    const XrResult validation = api_validation::ValidateEnumeration(capacity, count, modes, 1);
+    if (XR_FAILED(validation) || capacity == 0) return validation;
+    modes[0] = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
     return XR_SUCCESS;
 }
 
@@ -8021,13 +8032,13 @@ static XrResult XRAPI_PTR xrLocateSpace_runtime(XrSpace space, XrSpace baseSpace
     return XR_SUCCESS;
 }
 
-static XrResult XRAPI_PTR xrEnumerateReferenceSpaces_runtime(XrSession, uint32_t capacity, uint32_t* count, XrReferenceSpaceType* spaces) {
-    if (count) *count = 3;
-    if (capacity >= 3 && spaces) {
-        spaces[0] = XR_REFERENCE_SPACE_TYPE_VIEW;
-        spaces[1] = XR_REFERENCE_SPACE_TYPE_LOCAL;
-        spaces[2] = XR_REFERENCE_SPACE_TYPE_STAGE;
-    }
+static XrResult XRAPI_PTR xrEnumerateReferenceSpaces_runtime(XrSession session, uint32_t capacity, uint32_t* count, XrReferenceSpaceType* spaces) {
+    if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
+    const XrResult validation = api_validation::ValidateEnumeration(capacity, count, spaces, 3);
+    if (XR_FAILED(validation) || capacity == 0) return validation;
+    spaces[0] = XR_REFERENCE_SPACE_TYPE_VIEW;
+    spaces[1] = XR_REFERENCE_SPACE_TYPE_LOCAL;
+    spaces[2] = XR_REFERENCE_SPACE_TYPE_STAGE;
     return XR_SUCCESS;
 }
 
