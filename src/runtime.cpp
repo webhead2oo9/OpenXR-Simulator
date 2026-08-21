@@ -4034,7 +4034,11 @@ static XrResult XRAPI_PTR xrEnumerateSwapchainImages_runtime(XrSwapchain sc, uin
         // the right shape for both extensions.
         auto* arr = reinterpret_cast<XrSwapchainImageVulkanKHR*>(images);
         for (uint32_t i = 0; i < n; ++i) {
-            if (arr[i].type != XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR) return XR_ERROR_VALIDATION_FAILURE;
+            // Tolerate zero-initialized arrays the way shipping runtimes do - engines
+            // commonly pass them and expect the runtime to fill in type. A WRONG
+            // non-zero type is still a genuine error.
+            if (arr[i].type == 0) arr[i].type = XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR;
+            else if (arr[i].type != XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR) return XR_ERROR_VALIDATION_FAILURE;
             arr[i].image = it->second.imagesVk[i];
         }
         Logf("[SimXR] xrEnumerateSwapchainImages(Vulkan): sc=%p count=%u", sc, n);
@@ -4043,7 +4047,8 @@ static XrResult XRAPI_PTR xrEnumerateSwapchainImages_runtime(XrSwapchain sc, uin
     if (it->second.backend == rt::Swapchain::Backend::D3D12) {
         auto* arr = reinterpret_cast<XrSwapchainImageD3D12KHR*>(images);
         for (uint32_t i = 0; i < n; ++i) {
-            if (arr[i].type != XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR) return XR_ERROR_VALIDATION_FAILURE;
+            if (arr[i].type == 0) arr[i].type = XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR;
+            else if (arr[i].type != XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR) return XR_ERROR_VALIDATION_FAILURE;
             arr[i].texture = it->second.images12[i].Get();
         }
         Logf("[SimXR] xrEnumerateSwapchainImages(D3D12): sc=%p count=%u", sc, n);
@@ -4051,7 +4056,8 @@ static XrResult XRAPI_PTR xrEnumerateSwapchainImages_runtime(XrSwapchain sc, uin
     } else if (it->second.backend == rt::Swapchain::Backend::OpenGL) {
         auto* arr = reinterpret_cast<XrSwapchainImageOpenGLKHR*>(images);
         for (uint32_t i = 0; i < n; ++i) {
-            if (arr[i].type != XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_KHR) return XR_ERROR_VALIDATION_FAILURE;
+            if (arr[i].type == 0) arr[i].type = XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_KHR;
+            else if (arr[i].type != XR_TYPE_SWAPCHAIN_IMAGE_OPENGL_KHR) return XR_ERROR_VALIDATION_FAILURE;
             arr[i].image = it->second.imagesGL[i];
         }
             // DEBUG: Log the texture IDs being returned AND verify content still matches
@@ -4078,7 +4084,8 @@ static XrResult XRAPI_PTR xrEnumerateSwapchainImages_runtime(XrSwapchain sc, uin
     } else {
         auto* arr = reinterpret_cast<XrSwapchainImageD3D11KHR*>(images);
         for (uint32_t i = 0; i < n; ++i) {
-            if (arr[i].type != XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR) return XR_ERROR_VALIDATION_FAILURE;
+            if (arr[i].type == 0) arr[i].type = XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR;
+            else if (arr[i].type != XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR) return XR_ERROR_VALIDATION_FAILURE;
             arr[i].texture = it->second.images[i].Get();
         }
         Logf("[SimXR] xrEnumerateSwapchainImages(D3D11): sc=%p count=%u", sc, n);
