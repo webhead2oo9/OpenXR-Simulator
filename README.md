@@ -87,6 +87,45 @@ cmake --build . --config Release
 
 The built runtime will be in `build/bin/Release/openxr_simulator.dll`
 
+## 🔌 MCP Server
+
+The bundled [MCP server](mcp-server/) exposes the simulator to LLM agents
+(Claude Code, and any other Model Context Protocol client) for hands-free
+testing, diagnosis, and driving of VR sessions:
+
+- **Capture** — `capture_screenshot` (stereo or per-eye), `get_frame_info`,
+  `get_projection_log`, `validate_stereo`
+- **Diagnose** — `read_logs`, `get_diagnostics`, `diagnose_issue`,
+  `get_session_state`, `get_head_tracking`, `clear_logs`
+- **Flicker detection** — `get_flicker_status`, `capture_flicker_window`,
+  `get_ui_flicker_status`, `capture_ui_flicker_window` (returns incident
+  contact sheets an agent can review visually)
+- **Control** — `set_head_pose`, `set_fov`, `set_ipd`, `set_headset_profile`,
+  `enable_anaglyph_preview`, `enable_pose_sweep`
+
+Quick start:
+
+```bash
+cd mcp-server
+pip install -e .
+python openxr_simulator_mcp.py
+```
+
+Point your MCP client at the script (e.g. for Claude Code):
+
+```json
+{
+  "mcpServers": {
+    "openxr-simulator": {
+      "command": "python",
+      "args": ["path/to/mcp-server/openxr_simulator_mcp.py"]
+    }
+  }
+}
+```
+
+See the [MCP server README](mcp-server/README.md) for full tool documentation.
+
 ## 📖 Technical Details
 
 ### Architecture
