@@ -41,7 +41,10 @@ except ImportError:
 
 # Configuration
 LOCALAPPDATA = os.environ.get("LOCALAPPDATA", "")
-SIMULATOR_DIR = Path(LOCALAPPDATA) / "OpenXR-Simulator"
+# SIMXR_DATA_DIR overrides the MCP<->runtime file-exchange folder (it must match the
+# same override in the runtime) so instances can run side by side and tests can run
+# against a throwaway directory instead of %LOCALAPPDATA%.
+SIMULATOR_DIR = Path(os.environ.get("SIMXR_DATA_DIR") or Path(LOCALAPPDATA) / "OpenXR-Simulator")
 # The runtime writes one log per process, openxr_simulator.<pid>.log, so there is no
 # single fixed log path -- resolve the newest match instead. Older builds wrote a
 # plain openxr_simulator.log; the glob covers both.
@@ -473,6 +476,23 @@ def _write_json_command(path: Path, payload: dict[str, Any]) -> None:
     with open(tmp, "w") as f:
         json.dump(payload, f)
     tmp.replace(path)
+
+
+def _write_control_command(path: Path, payload: dict[str, Any]) -> Optional[str]:
+    """Write a control-command file, refusing when no live runtime can consume it.
+
+    The runtime consumes command files on read, but one written while no OpenXR
+    application is running simply sits in the exchange folder until the NEXT
+    session launches and applies it on its first frame - e.g. teleporting a
+    fresh session to a stale head pose or FOV. Returns an error string for the
+    agent instead of writing in that case.
+    """
+    if not runtime_is_live():
+        return ("No live OpenXR Simulator runtime found. Start an OpenXR application "
+                "with the simulator active before sending this command; otherwise it "
+                "would sit unconsumed and apply unexpectedly to a future session.")
+    _write_json_command(path, payload)
+    return None
 
 
 def _deg(rad: float) -> float:
@@ -1026,10 +1046,12 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
                 ).get("lastIncidentDirectory", "")
             except (OSError, json.JSONDecodeError):
                 pass
-        _write_json_command(FLICKER_CAPTURE_REQUEST_FILE, {
+        err = _write_control_command(FLICKER_CAPTURE_REQUEST_FILE, {
             "requestedUnixMs": int(time.time() * 1000),
             "source": "mcp",
         })
+        if err:
+            return [TextContent(type="text", text=err)]
         deadline = time.time() + timeout
         incident_dir: Optional[Path] = None
         status: dict[str, Any] = {}
@@ -1116,10 +1138,12 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
                 ).get("lastIncidentDirectory", "")
             except (OSError, json.JSONDecodeError):
                 pass
-        _write_json_command(UI_FLICKER_CAPTURE_REQUEST_FILE, {
+        err = _write_control_command(UI_FLICKER_CAPTURE_REQUEST_FILE, {
             "requestedUnixMs": int(time.time() * 1000),
             "source": "mcp-ui-only",
         })
+        if err:
+            return [TextContent(type="text", text=err)]
         deadline = time.time() + timeout
         incident_dir: Optional[Path] = None
         status: dict[str, Any] = {}
@@ -1327,12 +1351,16 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
         }
         if "roll_deg" in arguments and arguments["roll_deg"] is not None:
             payload["roll"] = _rad(float(arguments["roll_deg"]))
-        _write_json_command(HEAD_POSE_CMD_FILE, payload)
+        err = _write_control_command(HEAD_POSE_CMD_FILE, payload)
+        if err:
+            return [TextContent(type="text", text=err)]
         return [TextContent(type="text", text=f"Head pose command queued: {payload}")]
 
     elif name == "set_fov":
         if arguments.get("clear"):
-            _write_json_command(FOV_CMD_FILE, {"clear": True})
+            err = _write_control_command(FOV_CMD_FILE, {"clear": True})
+            if err:
+                return [TextContent(type="text", text=err)]
             return [TextContent(type="text", text="FOV reverted to symmetric default.")]
         def _eye(d):
             if not d: return None
@@ -1346,28 +1374,38 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
         if L is None or R is None:
             return [TextContent(type="text",
                 text="set_fov requires both left_eye and right_eye sub-objects (or clear=true)")]
-        _write_json_command(FOV_CMD_FILE, {"left": L, "right": R})
+        err = _write_control_command(FOV_CMD_FILE, {"left": L, "right": R})
+        if err:
+            return [TextContent(type="text", text=err)]
         return [TextContent(type="text",
             text=f"Per-eye asymmetric FOV applied. left={L} right={R}")]
 
     elif name == "set_ipd":
         if arguments.get("clear"):
-            _write_json_command(IPD_CMD_FILE, {"clear": True})
+            err = _write_control_command(IPD_CMD_FILE, {"clear": True})
+            if err:
+                return [TextContent(type="text", text=err)]
             return [TextContent(type="text", text="IPD reverted to 64 mm.")]
         ipd_mm = float(arguments.get("ipd_mm", 64.0))
         if ipd_mm < 0 or ipd_mm > 200:
             return [TextContent(type="text", text="ipd_mm must be in [0, 200]")]
-        _write_json_command(IPD_CMD_FILE, {"ipd_mm": ipd_mm})
+        err = _write_control_command(IPD_CMD_FILE, {"ipd_mm": ipd_mm})
+        if err:
+            return [TextContent(type="text", text=err)]
         return [TextContent(type="text", text=f"IPD set to {ipd_mm:.1f} mm")]
 
     elif name == "set_headset_profile":
         prof_name = arguments.get("name", "default")
-        _write_json_command(HEADSET_PROFILE_CMD_FILE, {"name": prof_name})
+        err = _write_control_command(HEADSET_PROFILE_CMD_FILE, {"name": prof_name})
+        if err:
+            return [TextContent(type="text", text=err)]
         return [TextContent(type="text", text=f"Headset profile applied: {prof_name}")]
 
     elif name == "enable_anaglyph_preview":
         enabled = bool(arguments.get("enabled", True))
-        _write_json_command(ANAGLYPH_CMD_FILE, {"enabled": enabled})
+        err = _write_control_command(ANAGLYPH_CMD_FILE, {"enabled": enabled})
+        if err:
+            return [TextContent(type="text", text=err)]
         return [TextContent(type="text",
             text=f"Anaglyph preview {'enabled' if enabled else 'disabled'}.")]
 
@@ -1403,7 +1441,9 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
             "roll_amp_deg":  float(arguments.get("roll_amp_deg",  15.0)),
             "freq_hz":       float(arguments.get("freq_hz",        0.25)),
         }
-        _write_json_command(SIMULATOR_DIR / "pose_sweep_command.json", payload)
+        err = _write_control_command(SIMULATOR_DIR / "pose_sweep_command.json", payload)
+        if err:
+            return [TextContent(type="text", text=err)]
         return [TextContent(type="text",
             text=("Pose sweep " + ("enabled" if payload["enabled"] else "disabled") +
                   f" — yaw=±{payload['yaw_amp_deg']}° pitch=±{payload['pitch_amp_deg']}°"

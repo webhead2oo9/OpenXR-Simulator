@@ -37,6 +37,16 @@ inline void McpLogf(const char* fmt, ...) {
 
 inline const std::string& GetSimulatorDataPath() {
     static const std::string path = []() -> std::string {
+        // SIMXR_DATA_DIR overrides the MCP<->runtime exchange folder, matching the
+        // same override in the Python MCP server: side-by-side simulator instances
+        // and hermetic server tests can use a throwaway directory.
+        char over[MAX_PATH]{};
+        DWORD olen = GetEnvironmentVariableA("SIMXR_DATA_DIR", over, (DWORD)sizeof(over));
+        if (olen > 0 && olen < sizeof(over)) {
+            std::string dir(over);
+            while (!dir.empty() && (dir.back() == '\\' || dir.back() == '/')) dir.pop_back();
+            if (!dir.empty()) return dir;
+        }
         char base[MAX_PATH]{};
         DWORD len = GetEnvironmentVariableA("LOCALAPPDATA", base, (DWORD)sizeof(base));
         if (len > 0 && len < sizeof(base)) {
