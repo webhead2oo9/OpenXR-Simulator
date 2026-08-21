@@ -44,6 +44,9 @@ add_library(openxr_simulator SHARED
     src/preview_focus.h
     src/ui_enhancements.h
 )
+if(CMAKE_SIZEOF_VOID_P EQUAL 4)
+    target_sources(openxr_simulator PRIVATE openxr_simulator_x86.def)
+endif()
 
 include(CTest)
 if(BUILD_TESTING)

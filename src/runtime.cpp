@@ -3663,8 +3663,12 @@ static XrResult XRAPI_PTR xrCreateSwapchain_runtime(XrSession session, const XrS
     };
     if (!formatSupported()) return XR_ERROR_SWAPCHAIN_FORMAT_UNSUPPORTED;
 
-    rt::Swapchain chain{}; 
+    rt::Swapchain chain{};
+#if XR_PTR_SIZE == 8
     chain.handle = reinterpret_cast<XrSwapchain>(rt::g_nextSwapchainHandle++);
+#else
+    chain.handle = static_cast<XrSwapchain>(rt::g_nextSwapchainHandle++);
+#endif
     chain.format = (DXGI_FORMAT)ci->format;  // Store the original requested format
     chain.width = ci->width; 
     chain.height = ci->height; 
