@@ -761,6 +761,12 @@ struct ProjLogEntry {
     float aL[2] = {0,0}, aR[2] = {0,0}, aU[2] = {0,0}, aD[2] = {0,0};
     // Image sub-rect per eye (left/right): offset_x, offset_y, extent_w, extent_h
     int32_t rectX[2] = {0,0}, rectY[2] = {0,0}, rectW[2] = {0,0}, rectH[2] = {0,0};
+    // The released images that supplied this projection. releaseSerial increments on
+    // every successful xrReleaseSwapchainImage; fresh=false therefore proves that the
+    // app resubmitted cached projection content rather than releasing a new image.
+    uint32_t imageIndex[2] = {UINT32_MAX, UINT32_MAX};
+    uint64_t releaseSerial[2] = {0,0};
+    bool fresh[2] = {false,false};
 };
 constexpr size_t PROJ_LOG_CAPACITY = 64;
 inline ProjLogEntry  g_projLog[PROJ_LOG_CAPACITY];
@@ -784,13 +790,17 @@ inline void DumpProjectionLog() {
                 "\"left_fov\":  {\"aL\": %.6f, \"aR\": %.6f, \"aU\": %.6f, \"aD\": %.6f}, "
                 "\"right_fov\": {\"aL\": %.6f, \"aR\": %.6f, \"aU\": %.6f, \"aD\": %.6f}, "
                 "\"left_rect\":  [%d, %d, %d, %d], "
-                "\"right_rect\": [%d, %d, %d, %d]}%s\n",
+                "\"right_rect\": [%d, %d, %d, %d], "
+                "\"images\": {\"left\": {\"index\": %u, \"releaseSerial\": %llu, \"fresh\": %s}, "
+                "\"right\": {\"index\": %u, \"releaseSerial\": %llu, \"fresh\": %s}}}%s\n",
                 e.frame, e.posX, e.posY, e.posZ,
                 e.poseQx, e.poseQy, e.poseQz, e.poseQw,
                 e.aL[0], e.aR[0], e.aU[0], e.aD[0],
                 e.aL[1], e.aR[1], e.aU[1], e.aD[1],
                 e.rectX[0], e.rectY[0], e.rectW[0], e.rectH[0],
                 e.rectX[1], e.rectY[1], e.rectW[1], e.rectH[1],
+                e.imageIndex[0], (unsigned long long)e.releaseSerial[0], e.fresh[0] ? "true" : "false",
+                e.imageIndex[1], (unsigned long long)e.releaseSerial[1], e.fresh[1] ? "true" : "false",
                 (i + 1 < n) ? "," : "");
     }
     fprintf(f, "  ]\n}\n");
@@ -816,9 +826,9 @@ inline bool CheckProjLogDumpRequest() {
 // artifacts (shadows lagging a head-pose whip) that a one-shot screenshot
 // round-trip is far too slow to catch.
 //
-// D3D12 and Vulkan sessions only: BurstOnFrame records the preview's DIB back
-// buffer, which is the one place a composited frame exists in CPU memory. A
-// D3D11 or OpenGL session acks the command as failed rather than recording it.
+// D3D12/Vulkan use the preview's existing DIB readback. D3D11 queues the fully
+// composed swapchain backbuffer into a non-blocking staging/query ring before Present.
+// OpenGL remains unsupported by this burst path.
 //
 // Drive it by writing burst_command.json:
 //   {"frames": 32, "pose": {"yaw": 25, "pitch": 0, "x": 0, "y": 1.7, "z": 0}}
@@ -923,11 +933,17 @@ inline void BurstFlush() {
             fprintf(f, "    {\"i\": %u, \"file\": \"burst_%03u.bmp\", \"frame\": %u, \"t_ms\": %.2f, "
                     "\"head\": {\"yaw\": %.4f, \"pitch\": %.4f, \"roll\": %.4f, \"x\": %.4f, \"y\": %.4f, \"z\": %.4f}, "
                     "\"submitted\": {\"frame\": %u, \"qx\": %.6f, \"qy\": %.6f, \"qz\": %.6f, \"qw\": %.6f, "
-                    "\"x\": %.4f, \"y\": %.4f, \"z\": %.4f}}%s\n",
+                    "\"x\": %.4f, \"y\": %.4f, \"z\": %.4f}, "
+                    "\"projectionFresh\": %s, "
+                    "\"images\": {\"left\": {\"index\": %u, \"releaseSerial\": %llu, \"fresh\": %s}, "
+                    "\"right\": {\"index\": %u, \"releaseSerial\": %llu, \"fresh\": %s}}}%s\n",
                     (unsigned)i, (unsigned)i, m.frame, m.tMs,
                     m.headYaw, m.headPitch, m.headRoll, m.headX, m.headY, m.headZ,
                     m.proj.frame, m.proj.poseQx, m.proj.poseQy, m.proj.poseQz, m.proj.poseQw,
                     m.proj.posX, m.proj.posY, m.proj.posZ,
+                    (m.proj.fresh[0] && m.proj.fresh[1]) ? "true" : "false",
+                    m.proj.imageIndex[0], (unsigned long long)m.proj.releaseSerial[0], m.proj.fresh[0] ? "true" : "false",
+                    m.proj.imageIndex[1], (unsigned long long)m.proj.releaseSerial[1], m.proj.fresh[1] ? "true" : "false",
                     (i + 1 < n) ? "," : "");
         }
         fprintf(f, "  ]\n}\n");

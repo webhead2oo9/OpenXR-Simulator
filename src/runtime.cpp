@@ -399,6 +399,10 @@ static constexpr UINT kQuadConstantCount = 28;
 // the composite be submitted and picked up a frame or two later instead, with the CPU
 // never waiting on the GPU at all.
 static constexpr UINT kPreviewFrames = 3;
+// D3D11 forced captures can queue several consecutive frames before their EVENT queries
+// complete. Eight lazy staging slots preserve cadence without permanently reserving memory;
+// only slots the GPU actually needs are allocated.
+static constexpr UINT kD3D11ReadbackFrames = 8;
 // The desktop window can be maximized on a 4K display, but reading and scanning
 // a full 4K GDI surface on the application's xrEndFrame thread costs more than
 // an entire 90 Hz frame. Keep the mirror's internal surface at a diagnostic-
@@ -406,6 +410,24 @@ static constexpr UINT kPreviewFrames = 3;
 // Eye swapchain resolution is untouched; this affects only the desktop mirror.
 static constexpr UINT kPreviewMaxWidth = 1920;
 static constexpr UINT kPreviewMaxHeight = 1080;
+
+// D3D11 normally presents its composited swapchain backbuffer directly. During a forced
+// detector capture or MCP burst, three staging slots copy that final backbuffer before
+// Present and are mapped only after an EVENT query says the GPU finished. This preserves
+// normal D3D11 performance and avoids changing the temporal behavior being diagnosed.
+struct PreviewFrame11 {
+    ComPtr<ID3D11Texture2D> staging;
+    ComPtr<ID3D11Query> ready;
+    UINT width{0}, height{0};
+    DXGI_FORMAT format{DXGI_FORMAT_UNKNOWN};
+    bool pending{false};
+    uint64_t generation{0};
+    uint32_t frame{0};
+    bool hasProjection{false};
+    float headYaw{0}, headPitch{0}, headRoll{0};
+    float headX{0}, headY{0}, headZ{0};
+    mcp::ProjLogEntry proj{};
+};
 
 struct PreviewFrame12 {
     ComPtr<ID3D12CommandAllocator> alloc;
@@ -514,6 +536,12 @@ struct Session {
     UINT previewSrvStride{0};
     UINT previewSrvSlot{0};
 
+    // On-demand D3D11 diagnostic readback. Slots are consumed asynchronously on later
+    // xrEndFrame calls; pending slots are never overwritten or waited on.
+    PreviewFrame11 previewFrames11[kD3D11ReadbackFrames];
+    UINT previewReadback11Slot{0};
+    uint64_t previewReadback11Generation{0};
+
     // Blit resources
     ComPtr<ID3D11VertexShader> blitVS;
     ComPtr<ID3D11PixelShader> blitPS;
@@ -591,6 +619,8 @@ struct Swapchain {
     GLenum glInternalFormat{GL_RGBA8};                // OpenGL internal format
     uint32_t lastAcquired{UINT32_MAX};  // Initialize to invalid
     uint32_t lastReleased{UINT32_MAX};  // Initialize to invalid
+    uint64_t releaseSerial{0};          // increments on every successful release
+    uint64_t lastProjectionReleaseSerial{0}; // last serial submitted in a projection
     uint32_t imageCount{3};
     swapchain_state::Lifecycle lifecycle;
 };
@@ -2992,6 +3022,7 @@ static XrResult XRAPI_PTR xrEnumerateInstanceExtensionProperties_runtime(const c
 }
 
 static XrResult XRAPI_PTR xrDestroySession_runtime(XrSession session);
+static void resetD3D11PreviewReadbacks(rt::Session& session);
 
 static XrResult XRAPI_PTR xrCreateInstance_runtime(const XrInstanceCreateInfo* createInfo, XrInstance* instance) {
     if (!createInfo || !instance || createInfo->type != XR_TYPE_INSTANCE_CREATE_INFO ||
@@ -3471,6 +3502,7 @@ static XrResult XRAPI_PTR xrDestroySession_runtime(XrSession s) {
     // Reset session but don't destroy the window
     rt::g_session.handle = XR_NULL_HANDLE;
     rt::g_session.state = XR_SESSION_STATE_IDLE;
+    resetD3D11PreviewReadbacks(rt::g_session);
     rt::g_session.d3d11Device.Reset();
     rt::g_session.d3d11Context.Reset();
     rt::g_session.usesD3D12 = false;
@@ -4135,6 +4167,7 @@ static XrResult XRAPI_PTR xrReleaseSwapchainImage_runtime(XrSwapchain sc, const 
     const XrResult result = ch.lifecycle.Release(released);
     if (XR_FAILED(result)) return result;
     ch.lastReleased = released;
+    ++ch.releaseSerial;
 
     // For D3D12: the app has finished using this image, reset our tracked state to COMMON.
     // D3D12 implicit state promotion/decay means COMMON is always safe after a GPU sync point.
@@ -5916,6 +5949,174 @@ static void saveD3D12Screenshot(const uint8_t* pixels, UINT width, UINT height, 
 // the readback on D3D12 and OpenGL, and the composite and Present on all three.
 static bool g_previewDueThisFrame = true;
 
+// --- On-demand D3D11 preview readback ---------------------------------------------------------
+
+static void resetD3D11PreviewReadbacks(rt::Session& s) {
+    for (auto& frame : s.previewFrames11) frame = rt::PreviewFrame11{};
+    s.previewReadback11Slot = 0;
+    s.previewReadback11Generation = 0;
+}
+
+static bool ensureD3D11PreviewReadbackSlot(rt::Session& s, rt::PreviewFrame11& frame,
+                                           ID3D11Texture2D* source) {
+    if (!s.d3d11Device || !source || frame.pending) return false;
+    D3D11_TEXTURE2D_DESC sourceDesc{};
+    source->GetDesc(&sourceDesc);
+    if (sourceDesc.Width == 0 || sourceDesc.Height == 0 || sourceDesc.SampleDesc.Count != 1) {
+        return false;
+    }
+    if (frame.staging && frame.ready && frame.width == sourceDesc.Width &&
+        frame.height == sourceDesc.Height && frame.format == sourceDesc.Format) {
+        return true;
+    }
+
+    frame.staging.Reset();
+    frame.ready.Reset();
+    D3D11_TEXTURE2D_DESC stagingDesc = sourceDesc;
+    stagingDesc.Usage = D3D11_USAGE_STAGING;
+    stagingDesc.BindFlags = 0;
+    stagingDesc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    stagingDesc.MiscFlags = 0;
+    if (FAILED(s.d3d11Device->CreateTexture2D(
+            &stagingDesc, nullptr, frame.staging.GetAddressOf()))) {
+        Log("[SimXR] D3D11 detector: failed to create staging texture");
+        return false;
+    }
+    D3D11_QUERY_DESC queryDesc{};
+    queryDesc.Query = D3D11_QUERY_EVENT;
+    if (FAILED(s.d3d11Device->CreateQuery(&queryDesc, frame.ready.GetAddressOf()))) {
+        frame.staging.Reset();
+        Log("[SimXR] D3D11 detector: failed to create completion query");
+        return false;
+    }
+    frame.width = sourceDesc.Width;
+    frame.height = sourceDesc.Height;
+    frame.format = sourceDesc.Format;
+    return true;
+}
+
+static flicker::PreviewFrameInfo previewInfoFromProjection(const mcp::ProjLogEntry& projection) {
+    flicker::PreviewFrameInfo info;
+    for (int eye = 0; eye < 2; ++eye) {
+        info.imageIndex[eye] = projection.imageIndex[eye];
+        info.releaseSerial[eye] = projection.releaseSerial[eye];
+        info.fresh[eye] = projection.fresh[eye];
+    }
+    return info;
+}
+
+static void consumeD3D11PreviewReadbacks(rt::Session& s) {
+    if (!s.d3d11Context) return;
+    for (UINT consumed = 0; consumed < rt::kD3D11ReadbackFrames; ++consumed) {
+        rt::PreviewFrame11* oldest = nullptr;
+        for (auto& candidate : s.previewFrames11) {
+            if (!candidate.pending || !candidate.staging || !candidate.ready) continue;
+            if (!oldest || candidate.generation < oldest->generation) oldest = &candidate;
+        }
+        if (!oldest) return;
+        rt::PreviewFrame11& frame = *oldest;
+        const HRESULT ready = s.d3d11Context->GetData(
+            frame.ready.Get(), nullptr, 0, D3D11_ASYNC_GETDATA_DONOTFLUSH);
+        // Commands on one immediate context complete in order. If the oldest copy is not
+        // ready, no later frame is safe to map either; preserve strict frame ordering.
+        if (ready == S_FALSE) return;
+        if (FAILED(ready)) {
+            frame.pending = false;
+            continue;
+        }
+
+        D3D11_MAPPED_SUBRESOURCE mapped{};
+        const HRESULT mappedResult = s.d3d11Context->Map(
+            frame.staging.Get(), 0, D3D11_MAP_READ, D3D11_MAP_FLAG_DO_NOT_WAIT, &mapped);
+        if (mappedResult == DXGI_ERROR_WAS_STILL_DRAWING) return;
+        if (FAILED(mappedResult) || !mapped.pData) {
+            frame.pending = false;
+            continue;
+        }
+
+        const uint8_t* pixels = static_cast<const uint8_t*>(mapped.pData);
+        uint32_t pitch = mapped.RowPitch;
+        std::vector<uint8_t> normalized;
+        const bool rgba = frame.format == DXGI_FORMAT_R8G8B8A8_UNORM ||
+                          frame.format == DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+        const bool bgra = frame.format == DXGI_FORMAT_B8G8R8A8_UNORM ||
+                          frame.format == DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+        if (rgba) {
+            // The detector and burst files use BGRA. Normalize only on the diagnostic
+            // path; no extra full-frame copy exists during normal D3D11 rendering.
+            normalized.resize((size_t)frame.width * frame.height * 4);
+            for (UINT y = 0; y < frame.height; ++y) {
+                const uint8_t* src = pixels + (size_t)y * mapped.RowPitch;
+                uint8_t* dst = normalized.data() + (size_t)y * frame.width * 4;
+                for (UINT x = 0; x < frame.width; ++x) {
+                    dst[x * 4 + 0] = src[x * 4 + 2];
+                    dst[x * 4 + 1] = src[x * 4 + 1];
+                    dst[x * 4 + 2] = src[x * 4 + 0];
+                    dst[x * 4 + 3] = src[x * 4 + 3];
+                }
+            }
+            pixels = normalized.data();
+            pitch = frame.width * 4;
+        } else if (!bgra) {
+            static bool loggedUnsupported = false;
+            if (!loggedUnsupported) {
+                loggedUnsupported = true;
+                Logf("[SimXR] D3D11 detector: unsupported backbuffer format %d", (int)frame.format);
+            }
+            s.d3d11Context->Unmap(frame.staging.Get(), 0);
+            frame.pending = false;
+            continue;
+        }
+
+        if (frame.hasProjection) {
+            mcp::g_lastProjEntry = frame.proj;
+            const flicker::PreviewFrameInfo previewInfo = previewInfoFromProjection(frame.proj);
+            flicker::ObservePreview(pixels, frame.width, frame.height, pitch,
+                                    frame.generation, frame.frame, &previewInfo);
+            if (mcp::g_burstActive) {
+                mcp::BurstOnFrame(pixels, (int)frame.width, (int)frame.height, (int)pitch,
+                                  frame.frame, frame.headYaw, frame.headPitch, frame.headRoll,
+                                  frame.headX, frame.headY, frame.headZ);
+            }
+        }
+        s.d3d11Context->Unmap(frame.staging.Get(), 0);
+        frame.pending = false;
+    }
+}
+
+static void queueD3D11PreviewReadback(rt::Session& s, ID3D11Texture2D* backbuffer,
+                                      uint32_t frameCount) {
+    if (!s.d3d11Context || !backbuffer) return;
+    if (!flicker::WantsPreviewReadback() && !mcp::g_burstActive) return;
+
+    UINT selected = rt::kD3D11ReadbackFrames;
+    for (UINT offset = 0; offset < rt::kD3D11ReadbackFrames; ++offset) {
+        const UINT index = (s.previewReadback11Slot + offset) % rt::kD3D11ReadbackFrames;
+        if (!s.previewFrames11[index].pending) {
+            selected = index;
+            break;
+        }
+    }
+    if (selected == rt::kD3D11ReadbackFrames) {
+        // Diagnostic readback must never make xrEndFrame wait. A full ring means the GPU
+        // is more than eight previews behind; drop this sample and try again next frame.
+        return;
+    }
+
+    rt::PreviewFrame11& frame = s.previewFrames11[selected];
+    if (!ensureD3D11PreviewReadbackSlot(s, frame, backbuffer)) return;
+    s.d3d11Context->CopyResource(frame.staging.Get(), backbuffer);
+    s.d3d11Context->End(frame.ready.Get());
+    frame.pending = true;
+    frame.generation = ++s.previewReadback11Generation;
+    frame.frame = frameCount;
+    frame.hasProjection = true;
+    frame.headYaw = rt::g_headYaw; frame.headPitch = rt::g_headPitch; frame.headRoll = rt::g_headRoll;
+    frame.headX = rt::g_headPos.x; frame.headY = rt::g_headPos.y; frame.headZ = rt::g_headPos.z;
+    frame.proj = mcp::g_lastProjEntry;
+    s.previewReadback11Slot = (selected + 1) % rt::kD3D11ReadbackFrames;
+}
+
 // --- Preview frame slots (D3D12) --------------------------------------------------------------
 
 // Open this frame's slot, or nullptr if all of them are still on the GPU. The eye composite
@@ -6115,8 +6316,9 @@ static void paintPreviewComposite(rt::Session& s, rt::PreviewFrame12& f) {
     // not a 64-pixel multiple cost a full-frame memcpy here on every painted frame.
     const uint8_t* detectorPixels = (const uint8_t*)mapped;
     if (f.hasProjection) {
+        const flicker::PreviewFrameInfo previewInfo = previewInfoFromProjection(f.proj);
         flicker::ObservePreview(detectorPixels, f.rtWidth, f.rtHeight,
-                                s.previewReadbackPitch, f.fenceValue, f.frame);
+                                s.previewReadbackPitch, f.fenceValue, f.frame, &previewInfo);
     }
     flicker::UiFrameInfo uiInfo;
     uiInfo.quadLayers = f.quadLayers;
@@ -7857,6 +8059,7 @@ static void RecordProjectionSubmission(const XrCompositionLayerProjection& proje
     entry.posY = projection.views[0].pose.position.y;
     entry.posZ = projection.views[0].pose.position.z;
     const uint32_t count = (std::min)(projection.viewCount, 2u);
+    XrSwapchain seenSwapchains[2] = {XR_NULL_HANDLE, XR_NULL_HANDLE};
     for (uint32_t view = 0; view < count; ++view) {
         entry.aL[view] = projection.views[view].fov.angleLeft;
         entry.aR[view] = projection.views[view].fov.angleRight;
@@ -7866,6 +8069,29 @@ static void RecordProjectionSubmission(const XrCompositionLayerProjection& proje
         entry.rectY[view] = projection.views[view].subImage.imageRect.offset.y;
         entry.rectW[view] = projection.views[view].subImage.imageRect.extent.width;
         entry.rectH[view] = projection.views[view].subImage.imageRect.extent.height;
+
+        const XrSwapchain handle = projection.views[view].subImage.swapchain;
+        auto chainIt = rt::g_swapchains.find(handle);
+        if (chainIt != rt::g_swapchains.end()) {
+            rt::Swapchain& chain = chainIt->second;
+            entry.imageIndex[view] = chain.lastReleased;
+            entry.releaseSerial[view] = chain.releaseSerial;
+            bool alreadySeen = false;
+            for (uint32_t previous = 0; previous < view; ++previous) {
+                if (seenSwapchains[previous] == handle) {
+                    entry.fresh[view] = entry.fresh[previous];
+                    alreadySeen = true;
+                    break;
+                }
+            }
+            if (!alreadySeen) {
+                entry.fresh[view] = chain.lastReleased != UINT32_MAX &&
+                    chain.releaseSerial != 0 &&
+                    chain.releaseSerial != chain.lastProjectionReleaseSerial;
+                chain.lastProjectionReleaseSerial = chain.releaseSerial;
+            }
+        }
+        seenSwapchains[view] = handle;
     }
     mcp::g_projLog[mcp::g_projLogHead] = entry;
     mcp::g_projLogHead = (mcp::g_projLogHead + 1) % mcp::PROJ_LOG_CAPACITY;
@@ -7929,12 +8155,10 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession session, const XrFrameEnd
     // burst's baseline and every later frame shows the app catching up.
     if (mcp::g_commandsDue) {
         mcp::BurstCommand bc = mcp::CheckBurstCommand();
-        if (bc.valid && !rt::g_session.usesD3D12) {
-            // A burst is recorded out of the D3D12 preview's DIB back buffer, the only place
-            // a composited frame sits in CPU memory. The D3D11 and OpenGL previews go
-            // straight to a swapchain, so say so rather than leaving a poller waiting on a
-            // burst_done.json that is never coming.
-            Log("[SimXR] burst: only D3D12 and Vulkan sessions can be recorded");
+        if (bc.valid && rt::g_session.usesOpenGL) {
+            // D3D12/Vulkan already expose a CPU DIB; direct D3D11 now uses an asynchronous
+            // staging ring. OpenGL is the only backend still without this burst path.
+            Log("[SimXR] burst: OpenGL sessions cannot be recorded");
             mcp::WriteCommandAck("burst", false);
         } else if (bc.valid) {
             if (bc.pose.valid) {
@@ -7954,7 +8178,10 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession session, const XrFrameEnd
     // hangs off it (see g_previewDueThisFrame). A pending screenshot or a running burst
     // overrides the cap - both asked for a particular frame, not for the next one the rate
     // happens to allow, and with the mirror off there would be no next one.
-    g_previewDueThisFrame = ui::PreviewFrameDue() || mcp::g_screenshotRequested || mcp::g_burstActive;
+    // Forced detector windows and bursts require consecutive composed xrEndFrame samples;
+    // neither is allowed to inherit the user's Mirror Rate cap.
+    g_previewDueThisFrame = ui::PreviewFrameDue() || mcp::g_screenshotRequested ||
+                            mcp::g_burstActive || flicker::WantsPreviewReadback();
 
     // Order the app's Vulkan queue against the compositor's D3D12 queue. Skipped when the
     // mirror is not due this frame: nothing reads the app's images then.
@@ -8094,6 +8321,22 @@ static XrResult XRAPI_PTR xrEndFrame_runtime(XrSession session, const XrFrameEnd
     }
     // Every command file has been looked at for this change notification.
     mcp::g_commandsDue = false;
+
+    // Consume older D3D11 staging slots without flushing or waiting, then queue this
+    // xrEndFrame's fully composed two-eye backbuffer before flip-model Present makes its
+    // contents undefined. A forced capture/burst already overrode Mirror Rate above.
+    if (!rt::g_session.usesD3D12 && !rt::g_session.usesOpenGL) {
+        consumeD3D11PreviewReadbacks(rt::g_session);
+        if (g_presentPending && g_previewDueThisFrame && projectionComposed &&
+            rt::g_session.previewSwapchain) {
+            ComPtr<ID3D11Texture2D> composedBackbuffer;
+            if (SUCCEEDED(rt::g_session.previewSwapchain->GetBuffer(
+                    0, IID_PPV_ARGS(composedBackbuffer.GetAddressOf())))) {
+                queueD3D11PreviewReadback(rt::g_session, composedBackbuffer.Get(),
+                                          (uint32_t)frameCount);
+            }
+        }
+    }
 
     // D3D11 and OpenGL capture from the preview swapchain inside presentProjection, which a
     // frame carrying no projection layer never reaches - so on a 2D-only frame the request

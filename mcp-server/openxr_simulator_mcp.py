@@ -684,9 +684,9 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="capture_flicker_window",
-            description="Capture the simulator's rolling composed-preview history plus following frames now, "
-                       "even if the automatic detector threshold has not fired. Returns a contact sheet for "
-                       "direct temporal review by an LLM.",
+            description="Capture consecutive fully composed preview frames now, bypassing the Mirror Rate cap, "
+                       "even if the automatic detector threshold has not fired. Returns a contact sheet plus "
+                       "per-frame swapchain release/freshness metadata for direct temporal review by an LLM.",
             inputSchema={
                 "type": "object",
                 "properties": {
@@ -1071,7 +1071,7 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
         if not incident_dir:
             return [TextContent(
                 type="text",
-                text="Timed out waiting for a manual composed-preview burst. The simulator may not be rendering new D3D12 preview frames."
+                text="Timed out waiting for a manual composed-preview burst. The simulator may not be rendering new composed projection frames."
             )]
         # Give the post-trigger ring a short opportunity to finish without making
         # a partially filled packet look like a detector failure.
@@ -1079,10 +1079,21 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
         while time.time() < settle_deadline and len(list(incident_dir.glob("frame*_preview.bmp"))) < max_frames:
             time.sleep(0.1)
         contact_sheet = build_flicker_contact_sheet(incident_dir, max_frames)
+        frame_metadata: list[dict[str, Any]] = []
+        for metadata_path in incident_dir.glob("frame*_meta.json"):
+            try:
+                frame_metadata.append(json.loads(metadata_path.read_text(encoding="utf-8")))
+            except (OSError, json.JSONDecodeError):
+                pass
+        frame_metadata.sort(key=lambda item: int(item.get("frame", 0)))
+        # build_flicker_contact_sheet selects the newest max_frames frames; metadata must
+        # describe exactly those same images rather than the oldest head of the packet.
+        selected_metadata = frame_metadata[-max_frames:]
         result = [TextContent(type="text", text=json.dumps({
             "captureSource": "openxr-simulator-composed-preview",
             "incidentDirectory": str(incident_dir),
             "framesAvailable": len(list(incident_dir.glob("frame*_preview.bmp"))),
+            "frames": selected_metadata,
             "status": status,
         }, indent=2))]
         if contact_sheet:
