@@ -121,6 +121,7 @@ endif()
 set(RUNTIME_MANIFEST_CONTENT "{
     \"file_format_version\": \"1.0.0\",
     \"runtime\": {
+        \"name\": \"OpenXR Simulator\",
         \"library_path\": \"${CMAKE_SOURCE_DIR}/bin/openxr_simulator.dll\"
     }
 }")

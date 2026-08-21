@@ -322,6 +322,13 @@ static DXGI_FORMAT ToTypeless(DXGI_FORMAT format) {
 // Released from WndProc and instance teardown, both of which run long before the D3D12
 // preview path where it is defined.
 namespace rt { struct Session; }
+
+// QPC-derived time helpers, defined further down. Integer math only - the same
+// conversion xrConvertWin32PerformanceCounterToTimeKHR performs. File-scope statics:
+// unqualified calls inside namespace rt resolve to these through the enclosing scope.
+static XrTime QpcToNs(long long counter, long long freq);
+static XrTime CurrentXrTime();
+
 // Runtime state
 namespace rt {
 
@@ -330,10 +337,13 @@ struct Swapchain;
 // Forward declarations
 void PushState(XrSession s, XrSessionState newState);
 
+// Event queue drained by xrPollEvent. Lives in this early block so functions like
+// xrDestroySession can discard queued events that reference destroyed handles.
+static std::vector<XrEventDataBuffer> g_eventQueue;
+
 // Global adapter LUID that we'll use consistently
 static LUID g_adapterLuid = {};
 static bool g_adapterLuidSet = false;
-
 // Global persistent window that survives session creation/destruction
 static HWND g_persistentWindow = nullptr;
 static std::mutex g_windowMutex;
@@ -350,6 +360,17 @@ static std::atomic<UINT> g_sourceHeight{0};
 struct Instance {
     XrInstance handle{XR_NULL_HANDLE};
     std::vector<std::string> enabledExtensions;
+    // Per spec (each graphics-binding extension chapter), xrCreateSession must return
+    // XR_ERROR_GRAPHICS_REQUIREMENTS_CALL_MISSING unless the matching requirements
+    // function was already called for this instance (there is only one systemId).
+    bool d3d11RequirementsCalled{false};
+    bool d3d12RequirementsCalled{false};
+    bool openglRequirementsCalled{false};
+    bool vulkanRequirementsCalled{false};
+    // Adapter LUIDs reported by the requirements functions, used to validate the app's
+    // device at xrCreateSession (XR_ERROR_GRAPHICS_DEVICE_INVALID on mismatch).
+    LUID d3d11RequirementsLuid{};
+    LUID d3d12RequirementsLuid{};
 };
 
 // The D3D12 preview back buffer is always BGRA8, whatever the app submits: that is the
@@ -1915,6 +1936,10 @@ static PFN_vkGetInstanceProcAddr g_appGipa = nullptr;
 // handed an instance, so remember the one the app created or asked about.
 static VkInstance g_lastInstance = VK_NULL_HANDLE;
 
+// Physical device last reported through xrGetVulkanGraphicsDeviceKHR/2KHR, against which
+// xrCreateVulkanDeviceKHR validates the app's chosen vulkanPhysicalDevice.
+static VkPhysicalDevice g_reportedPhysicalDevice = VK_NULL_HANDLE;
+
 static PFN_vkGetInstanceProcAddr Gipa() {
     if (g_appGipa) return g_appGipa;
     static PFN_vkGetInstanceProcAddr cached = []() -> PFN_vkGetInstanceProcAddr {
@@ -2374,6 +2399,7 @@ static XrResult CreateSwapchainImages(rt::Session& s, rt::Swapchain& chain, cons
     if (ci.usageFlags & XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT) usage |= VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT;
     if (ci.usageFlags & XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT) usage |= VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT;
     if (ci.usageFlags & XR_SWAPCHAIN_USAGE_SAMPLED_BIT) usage |= VK_IMAGE_USAGE_SAMPLED_BIT;
+    if (ci.usageFlags & XR_SWAPCHAIN_USAGE_TRANSFER_SRC_BIT) usage |= VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
     if (ci.usageFlags & XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT) usage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT;
     if (ci.usageFlags & XR_SWAPCHAIN_USAGE_UNORDERED_ACCESS_BIT) usage |= VK_IMAGE_USAGE_STORAGE_BIT;
     if (!(usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT))) {
@@ -2645,7 +2671,9 @@ static XrResult XRAPI_PTR xrGetD3D12GraphicsRequirementsKHR_runtime(
         req->adapterLuid = d.AdapterLuid;
         break;
     }
+    rt::g_instance.d3d12RequirementsLuid = req->adapterLuid;
     req->minFeatureLevel = D3D_FEATURE_LEVEL_11_0;
+    rt::g_instance.d3d12RequirementsCalled = true;
     Log("[SimXR] xrGetD3D12GraphicsRequirementsKHR: SUCCESS");
     return XR_SUCCESS;
 }
@@ -2719,6 +2747,7 @@ static XrResult XRAPI_PTR xrGetD3D11GraphicsRequirementsKHR_runtime(
         // Save this LUID for later validation
         rt::g_adapterLuid = bestDesc.AdapterLuid;
         rt::g_adapterLuidSet = true;
+        rt::g_instance.d3d11RequirementsLuid = bestDesc.AdapterLuid;
         
         Logf("[SimXR] xrGetD3D11GraphicsRequirementsKHR: Returning:");
         Logf("[SimXR]   type = %d (expected %d)", req->type, XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR);
@@ -2730,6 +2759,7 @@ static XrResult XRAPI_PTR xrGetD3D11GraphicsRequirementsKHR_runtime(
         Logf("[SimXR]   minFeatureLevel = 0x%X (D3D_FEATURE_LEVEL_11_0 = 0x%X)", 
              req->minFeatureLevel, D3D_FEATURE_LEVEL_11_0);
         
+        rt::g_instance.d3d11RequirementsCalled = true;
         Log("[SimXR] xrGetD3D11GraphicsRequirementsKHR: SUCCESS - Returning XR_SUCCESS");
         return XR_SUCCESS;
     }
@@ -2764,6 +2794,7 @@ static XrResult XRAPI_PTR xrGetOpenGLGraphicsRequirementsKHR_runtime(
          XR_VERSION_MINOR(req->maxApiVersionSupported),
          XR_VERSION_PATCH(req->maxApiVersionSupported));
 
+    rt::g_instance.openglRequirementsCalled = true;
     Log("[SimXR] xrGetOpenGLGraphicsRequirementsKHR: SUCCESS");
     return XR_SUCCESS;
 }
@@ -2781,6 +2812,8 @@ static XrResult XRAPI_PTR xrGetVulkanGraphicsRequirementsKHR_runtime(
     }
     req->minApiVersionSupported = XR_MAKE_VERSION(1, 0, 0);
     req->maxApiVersionSupported = XR_MAKE_VERSION(1, 4, 0);
+    // Serves both XR_KHR_vulkan_enable and XR_KHR_vulkan_enable2.
+    rt::g_instance.vulkanRequirementsCalled = true;
     Log("[SimXR] xrGetVulkanGraphicsRequirementsKHR: Vulkan 1.0 - 1.4");
     return XR_SUCCESS;
 }
@@ -2810,13 +2843,17 @@ static XrResult XRAPI_PTR xrGetVulkanDeviceExtensionsKHR_runtime(
 
 static XrResult XRAPI_PTR xrGetVulkanGraphicsDeviceKHR_runtime(
     XrInstance, XrSystemId, VkInstance vkInstance, VkPhysicalDevice* out) {
-    return vkrt::PickPhysicalDevice(vkInstance, out);
+    const XrResult result = vkrt::PickPhysicalDevice(vkInstance, out);
+    if (XR_SUCCEEDED(result)) vkrt::g_reportedPhysicalDevice = *out;
+    return result;
 }
 
 static XrResult XRAPI_PTR xrGetVulkanGraphicsDevice2KHR_runtime(
     XrInstance, const XrVulkanGraphicsDeviceGetInfoKHR* getInfo, VkPhysicalDevice* out) {
     if (!getInfo) return XR_ERROR_VALIDATION_FAILURE;
-    return vkrt::PickPhysicalDevice(getInfo->vulkanInstance, out);
+    const XrResult result = vkrt::PickPhysicalDevice(getInfo->vulkanInstance, out);
+    if (XR_SUCCEEDED(result)) vkrt::g_reportedPhysicalDevice = *out;
+    return result;
 }
 
 // Thin passthrough: the app's own vkCreateInstance runs, with the interop extensions the
@@ -2862,7 +2899,14 @@ static XrResult XRAPI_PTR xrCreateVulkanDeviceKHR_runtime(
     XrInstance, const XrVulkanDeviceCreateInfoKHR* createInfo, VkDevice* vulkanDevice, VkResult* vulkanResult) {
     if (!createInfo || !createInfo->pfnGetInstanceProcAddr || !createInfo->vulkanCreateInfo ||
         !createInfo->vulkanPhysicalDevice || !vulkanDevice || !vulkanResult) return XR_ERROR_VALIDATION_FAILURE;
-
+    // khr_vulkan_enable2.adoc: a physical device other than the one reported through
+    // xrGetVulkanGraphicsDeviceKHR is invalid. Only enforced once that function has
+    // actually been called, so apps that pick their own device still work.
+    if (vkrt::g_reportedPhysicalDevice != VK_NULL_HANDLE &&
+        createInfo->vulkanPhysicalDevice != vkrt::g_reportedPhysicalDevice) {
+        Log("[SimXR] xrCreateVulkanDeviceKHR: ERROR - vulkanPhysicalDevice does not match xrGetVulkanGraphicsDeviceKHR");
+        return XR_ERROR_HANDLE_INVALID;
+    }
     vkrt::g_appGipa = createInfo->pfnGetInstanceProcAddr;
     // Both are instance-level, and the only VkInstance in reach is the one the app made
     // through xrCreateVulkanInstanceKHR or named in xrGetVulkanGraphicsDevice2KHR.
@@ -3014,6 +3058,11 @@ static XrResult XRAPI_PTR xrCreateInstance_runtime(const XrInstanceCreateInfo* c
         Logf("[SimXR]   enabledExt[%u]=%s", i, requested);
     }
     rt::g_instance.enabledExtensions = std::move(enabledExtensions);
+    // A new instance starts with no requirements calls on record.
+    rt::g_instance.d3d11RequirementsCalled = false;
+    rt::g_instance.d3d12RequirementsCalled = false;
+    rt::g_instance.openglRequirementsCalled = false;
+    rt::g_instance.vulkanRequirementsCalled = false;
     rt::g_instance.handle = (XrInstance)1;
     *instance = rt::g_instance.handle;
     Log("[SimXR] xrCreateInstance: SUCCESS");
@@ -3212,6 +3261,12 @@ static XrResult XRAPI_PTR xrCreateSession_runtime(XrInstance instance, const XrS
                 return XR_ERROR_VALIDATION_FAILURE;
             }
             if (!b->device) return XR_ERROR_GRAPHICS_DEVICE_INVALID;
+            if (!rt::g_instance.d3d11RequirementsCalled) {
+                // Spec says to fail with XR_ERROR_GRAPHICS_REQUIREMENTS_CALL_MISSING
+                // here, but some engines skip the requirements call; warn instead so
+                // those apps keep working.
+                Log("[SimXR] xrCreateSession: WARNING - app did not call xrGetD3D11GraphicsRequirementsKHR first; continuing anyway");
+            }
             
             // Log the device details
             ComPtr<IDXGIDevice> dxgiDevice;
@@ -3223,6 +3278,15 @@ static XrResult XRAPI_PTR xrCreateSession_runtime(XrInstance instance, const XrS
                     Logf("[SimXR] xrCreateSession: App D3D11 device LUID=%llu/%llu", 
                          (unsigned long long)desc.AdapterLuid.HighPart,
                          (unsigned long long)desc.AdapterLuid.LowPart);
+                    const LUID& req = rt::g_instance.d3d11RequirementsLuid;
+                    // Only enforce when the requirements call actually happened; a
+                    // zero req LUID here would otherwise defeat the compat warning above.
+                    if (rt::g_instance.d3d11RequirementsCalled &&
+                        (desc.AdapterLuid.HighPart != req.HighPart ||
+                         desc.AdapterLuid.LowPart != req.LowPart)) {
+                        Log("[SimXR] xrCreateSession: ERROR - app device is not on the adapter named by xrGetD3D11GraphicsRequirementsKHR");
+                        return XR_ERROR_GRAPHICS_DEVICE_INVALID;
+                    }
                 }
             }
             
@@ -3237,6 +3301,9 @@ static XrResult XRAPI_PTR xrCreateSession_runtime(XrInstance instance, const XrS
             // Window will be created lazily on first frame
             *session = rt::g_session.handle;
             Logf("[SimXR] xrCreateSession: SUCCESS (D3D11, handle=%llu)", (unsigned long long)rt::g_session.handle);
+            // Spec (session.adoc): the first state-changed event for a new session
+            // must be one reporting XR_SESSION_STATE_IDLE.
+            rt::PushState(rt::g_session.handle, XR_SESSION_STATE_IDLE);
             // Push READY event into queue
             rt::PushState(rt::g_session.handle, XR_SESSION_STATE_READY);
             return XR_SUCCESS;
@@ -3246,6 +3313,18 @@ static XrResult XRAPI_PTR xrCreateSession_runtime(XrInstance instance, const XrS
                 return XR_ERROR_VALIDATION_FAILURE;
             }
             if (!b12->device || !b12->queue) return XR_ERROR_GRAPHICS_DEVICE_INVALID;
+            if (!rt::g_instance.d3d12RequirementsCalled) {
+                Log("[SimXR] xrCreateSession: WARNING - app did not call xrGetD3D12GraphicsRequirementsKHR first; continuing anyway");
+            }
+            {
+                const LUID deviceLuid = b12->device->GetAdapterLuid();
+                const LUID& req = rt::g_instance.d3d12RequirementsLuid;
+                if (rt::g_instance.d3d12RequirementsCalled &&
+                    (deviceLuid.HighPart != req.HighPart || deviceLuid.LowPart != req.LowPart)) {
+                    Log("[SimXR] xrCreateSession: ERROR - app device is not on the adapter named by xrGetD3D12GraphicsRequirementsKHR");
+                    return XR_ERROR_GRAPHICS_DEVICE_INVALID;
+                }
+            }
             rt::g_session.usesD3D12 = true;
             rt::g_session.d3d12Device = b12->device;
             rt::g_session.d3d12Queue = b12->queue;
@@ -3255,6 +3334,9 @@ static XrResult XRAPI_PTR xrCreateSession_runtime(XrInstance instance, const XrS
             rt::g_session.handle = newHandle;
             *session = rt::g_session.handle;
             Logf("[SimXR] xrCreateSession: SUCCESS (D3D12, handle=%llu)", (unsigned long long)rt::g_session.handle);
+            // Spec (session.adoc): the first state-changed event for a new session
+            // must be one reporting XR_SESSION_STATE_IDLE.
+            rt::PushState(rt::g_session.handle, XR_SESSION_STATE_IDLE);
             rt::PushState(rt::g_session.handle, XR_SESSION_STATE_READY);
             return XR_SUCCESS;
         } else if (entry->type == XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR) {
@@ -3264,6 +3346,9 @@ static XrResult XRAPI_PTR xrCreateSession_runtime(XrInstance instance, const XrS
             if (!extensionEnabled(XR_KHR_VULKAN_ENABLE_EXTENSION_NAME) &&
                 !extensionEnabled(XR_KHR_VULKAN_ENABLE2_EXTENSION_NAME)) {
                 return XR_ERROR_VALIDATION_FAILURE;
+            }
+            if (!rt::g_instance.vulkanRequirementsCalled) {
+                Log("[SimXR] xrCreateSession: WARNING - app did not call xrGetVulkanGraphicsRequirementsKHR(2) first; continuing anyway");
             }
             rt::g_session.d3d11Device.Reset();
             rt::g_session.d3d11Context.Reset();
@@ -3284,6 +3369,9 @@ static XrResult XRAPI_PTR xrCreateSession_runtime(XrInstance instance, const XrS
             rt::g_session.handle = newHandle;
             *session = rt::g_session.handle;
             Logf("[SimXR] xrCreateSession: SUCCESS (Vulkan, handle=%llu)", (unsigned long long)rt::g_session.handle);
+            // Spec (session.adoc): the first state-changed event for a new session
+            // must be one reporting XR_SESSION_STATE_IDLE.
+            rt::PushState(rt::g_session.handle, XR_SESSION_STATE_IDLE);
             rt::PushState(rt::g_session.handle, XR_SESSION_STATE_READY);
             return XR_SUCCESS;
         } else if (entry->type == XR_TYPE_GRAPHICS_BINDING_OPENGL_WIN32_KHR) {
@@ -3292,6 +3380,9 @@ static XrResult XRAPI_PTR xrCreateSession_runtime(XrInstance instance, const XrS
                 return XR_ERROR_VALIDATION_FAILURE;
             }
             if (!bGL->hDC || !bGL->hGLRC) return XR_ERROR_GRAPHICS_DEVICE_INVALID;
+            if (!rt::g_instance.openglRequirementsCalled) {
+                Log("[SimXR] xrCreateSession: WARNING - app did not call xrGetOpenGLGraphicsRequirementsKHR first; continuing anyway");
+            }
             rt::g_session.usesOpenGL = true;
             rt::g_session.usesD3D12 = false;
             rt::g_session.glDC = bGL->hDC;
@@ -3305,6 +3396,9 @@ static XrResult XRAPI_PTR xrCreateSession_runtime(XrInstance instance, const XrS
             *session = rt::g_session.handle;
             Logf("[SimXR] xrCreateSession: SUCCESS (OpenGL, handle=%llu, hDC=%p, hGLRC=%p)",
                  (unsigned long long)rt::g_session.handle, bGL->hDC, bGL->hGLRC);
+            // Spec (session.adoc): the first state-changed event for a new session
+            // must be one reporting XR_SESSION_STATE_IDLE.
+            rt::PushState(rt::g_session.handle, XR_SESSION_STATE_IDLE);
             rt::PushState(rt::g_session.handle, XR_SESSION_STATE_READY);
             return XR_SUCCESS;
         }
@@ -3329,6 +3423,9 @@ static XrResult XRAPI_PTR xrDestroySession_runtime(XrSession s) {
         rt::g_session.frameLifecycle.Reset();
     }
     rt::g_session.frameCondition.notify_all();
+    // fundamentals.adoc: queued events containing destroyed handles must be discarded.
+    // Every queued event in this runtime references the (single) session.
+    rt::g_eventQueue.clear();
     
     // Transfer window and swapchain to global persistent storage
     // Unity likes to create/destroy sessions rapidly for compatibility checks
@@ -3499,12 +3596,36 @@ static XrResult XRAPI_PTR xrCreateSwapchain_runtime(XrSession session, const XrS
     if (!ci || !sc || ci->type != XR_TYPE_SWAPCHAIN_CREATE_INFO) return XR_ERROR_VALIDATION_FAILURE;
     if (session != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
     if (ci->width == 0 || ci->height == 0 || ci->arraySize == 0 || ci->mipCount == 0 ||
-        ci->sampleCount == 0 || (ci->faceCount != 1 && ci->faceCount != 6)) {
+        ci->sampleCount == 0) {
+        return XR_ERROR_VALIDATION_FAILURE;
+    }
+    if (ci->faceCount != 1) {
+        if (ci->faceCount == 6) {
+            // Cubemap swapchains are only composable through cube-layer extensions this
+            // runtime does not advertise; accepting them would create an uncompositable
+            // swapchain (it would then be rejected at xrEndFrame).
+            Log("[SimXR] xrCreateSwapchain: ERROR - cubemap swapchains (faceCount=6) are not supported");
+            return XR_ERROR_FEATURE_UNSUPPORTED;
+        }
         return XR_ERROR_VALIDATION_FAILURE;
     }
     if (ci->width > 4096 || ci->height > 4096) return XR_ERROR_VALIDATION_FAILURE;
     constexpr XrSwapchainCreateFlags supportedCreateFlags = XR_SWAPCHAIN_CREATE_STATIC_IMAGE_BIT;
     if (ci->createFlags & ~supportedCreateFlags) return XR_ERROR_FEATURE_UNSUPPORTED;
+
+    // rendering.adoc: unsupported usage bits must fail with XR_ERROR_FEATURE_UNSUPPORTED.
+    constexpr XrSwapchainUsageFlags supportedUsageFlags =
+        XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
+        XR_SWAPCHAIN_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT |
+        XR_SWAPCHAIN_USAGE_SAMPLED_BIT |
+        XR_SWAPCHAIN_USAGE_TRANSFER_SRC_BIT |
+        XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT |
+        XR_SWAPCHAIN_USAGE_UNORDERED_ACCESS_BIT |
+        XR_SWAPCHAIN_USAGE_MUTABLE_FORMAT_BIT;
+    if (ci->usageFlags & ~supportedUsageFlags) {
+        Logf("[SimXR] xrCreateSwapchain: ERROR - unsupported usageFlags=0x%X", ci->usageFlags);
+        return XR_ERROR_FEATURE_UNSUPPORTED;
+    }
 
     const auto formatSupported = [&]() {
         if (rt::g_session.usesVulkan) return vkrt::FindFormat(ci->format) != nullptr;
@@ -4218,7 +4339,6 @@ private:
 
 namespace rt {
     static XrSessionState g_state = XR_SESSION_STATE_IDLE;
-    static std::vector<XrEventDataBuffer> g_eventQueue;
     void PushState(XrSession s, XrSessionState ns) {
         g_state = ns;
         g_session.state = ns;
@@ -4236,7 +4356,7 @@ namespace rt {
         Logf("[SimXR] PushState: Session %llu -> %s", (unsigned long long)s, stateName);
         
         XrEventDataSessionStateChanged e{XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED};
-        e.session = s; e.state = ns; e.time = 0;
+        e.session = s; e.state = ns; e.time = CurrentXrTime();
         
         XrEventDataBuffer buf{};
         buf.type = XR_TYPE_EVENT_DATA_BUFFER;  // Set the base type
@@ -4349,12 +4469,16 @@ static XrResult XRAPI_PTR xrEndSession_runtime(XrSession s) {
 }
 static XrResult XRAPI_PTR xrRequestExitSession_runtime(XrSession s) {
     if (s != rt::g_session.handle) return XR_ERROR_HANDLE_INVALID;
+    bool alreadyStopping = false;
     {
         std::lock_guard<std::mutex> lock(rt::g_session.frameMutex);
         if (!rt::g_session.running) return XR_ERROR_SESSION_NOT_RUNNING;
+        alreadyStopping = rt::g_session.state == XR_SESSION_STATE_STOPPING;
         rt::g_session.exitRequested = true;
     }
-    rt::PushState(s, XR_SESSION_STATE_STOPPING);
+    // Re-requesting exit while already STOPPING must not re-deliver an
+    // unchanged state-changed event.
+    if (!alreadyStopping) rt::PushState(s, XR_SESSION_STATE_STOPPING);
     return XR_SUCCESS;
 }
 static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession session, const XrFrameWaitInfo* info, XrFrameState* s) {
@@ -4792,8 +4916,9 @@ static XrResult XRAPI_PTR xrWaitFrame_runtime(XrSession session, const XrFrameWa
     if ((double)now.QuadPart - nextTick > periodSec * (double)freq.QuadPart) {
         nextTick = (double)now.QuadPart;
     }
-    // Convert QPC to nanoseconds using double to avoid overflow on MSVC
-    XrTime nowTime = (XrTime)((double)now.QuadPart * 1000000000.0 / (double)freq.QuadPart);
+    // Exact integer conversion - the same math xrConvertWin32PerformanceCounterToTimeKHR
+    // performs, so predicted display times and converted times agree for one instant.
+    const XrTime nowTime = QpcToNs(now.QuadPart, freq.QuadPart);
     s->shouldRender = XR_TRUE; s->predictedDisplayPeriod = periodNs; s->predictedDisplayTime = nowTime + periodNs;
     return XR_SUCCESS;
 }
@@ -8547,13 +8672,17 @@ static bool IsAllowedBindingPath(const std::string& profile, const std::string& 
     return false;
 }
 
+static XrTime QpcToNs(long long counter, long long freq) {
+    const long long seconds = counter / freq;
+    const long long remainder = counter % freq;
+    return seconds * 1000000000LL + (remainder * 1000000000LL) / freq;
+}
+
 static XrTime CurrentXrTime() {
     LARGE_INTEGER counter{}, frequency{};
     QueryPerformanceCounter(&counter);
     QueryPerformanceFrequency(&frequency);
-    const long long seconds = counter.QuadPart / frequency.QuadPart;
-    const long long remainder = counter.QuadPart % frequency.QuadPart;
-    return seconds * 1000000000LL + (remainder * 1000000000LL) / frequency.QuadPart;
+    return QpcToNs(counter.QuadPart, frequency.QuadPart);
 }
 
 static XrResult XRAPI_PTR xrCreateActionSet_runtime(
@@ -9316,13 +9445,16 @@ static XrResult XRAPI_PTR xrStopHapticFeedback_runtime(
 static XrResult XRAPI_PTR xrConvertWin32PerformanceCounterToTimeKHR_runtime(XrInstance instance,
                                                                             const LARGE_INTEGER* performanceCounter,
                                                                             XrTime* time) {
+    if (!IsValidInstance(instance)) return XR_ERROR_HANDLE_INVALID;
     if (!performanceCounter || !time) return XR_ERROR_VALIDATION_FAILURE;
     
     LARGE_INTEGER freq;
     QueryPerformanceFrequency(&freq);
     
-    // Convert to nanoseconds
+    // Convert to nanoseconds, guarding against overflow (khr_win32_convert_performance_
+    // counter_time.adoc: XR_ERROR_TIME_INVALID when the output cannot represent the input).
     const long long secs = performanceCounter->QuadPart / freq.QuadPart;
+    if (secs > INT64_MAX / 1000000000LL) return XR_ERROR_TIME_INVALID;
     const long long rem = performanceCounter->QuadPart % freq.QuadPart;
     *time = secs * 1000000000LL + (rem * 1000000000LL) / freq.QuadPart;
     return XR_SUCCESS;
@@ -9331,13 +9463,15 @@ static XrResult XRAPI_PTR xrConvertWin32PerformanceCounterToTimeKHR_runtime(XrIn
 static XrResult XRAPI_PTR xrConvertTimeToWin32PerformanceCounterKHR_runtime(XrInstance instance,
                                                                              XrTime time,
                                                                              LARGE_INTEGER* performanceCounter) {
+    if (!IsValidInstance(instance)) return XR_ERROR_HANDLE_INVALID;
     if (!performanceCounter) return XR_ERROR_VALIDATION_FAILURE;
     
     LARGE_INTEGER freq;
     QueryPerformanceFrequency(&freq);
     
-    // Convert from nanoseconds  
+    // Convert from nanoseconds, guarding against overflow
     const long long secs = time / 1000000000LL;
+    if (secs > INT64_MAX / freq.QuadPart) return XR_ERROR_TIME_INVALID;
     const long long rem = time % 1000000000LL;
     performanceCounter->QuadPart = secs * freq.QuadPart + (rem * freq.QuadPart) / 1000000000LL;
     return XR_SUCCESS;
