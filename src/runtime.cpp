@@ -6069,14 +6069,13 @@ static void consumeD3D11PreviewReadbacks(rt::Session& s) {
         }
 
         if (frame.hasProjection) {
-            mcp::g_lastProjEntry = frame.proj;
             const flicker::PreviewFrameInfo previewInfo = previewInfoFromProjection(frame.proj);
             flicker::ObservePreview(pixels, frame.width, frame.height, pitch,
                                     frame.generation, frame.frame, &previewInfo);
             if (mcp::g_burstActive) {
                 mcp::BurstOnFrame(pixels, (int)frame.width, (int)frame.height, (int)pitch,
                                   frame.frame, frame.headYaw, frame.headPitch, frame.headRoll,
-                                  frame.headX, frame.headY, frame.headZ);
+                                  frame.headX, frame.headY, frame.headZ, frame.proj);
             }
         }
         s.d3d11Context->Unmap(frame.staging.Get(), 0);
@@ -6305,10 +6304,10 @@ static void paintPreviewComposite(rt::Session& s, rt::PreviewFrame12& f) {
     // The burst records the frame that was just shown, described by the metadata that
     // frame was recorded with rather than by whatever the head is doing now.
     if (mcp::g_burstActive && f.hasProjection) {
-        mcp::g_lastProjEntry = f.proj;
         mcp::BurstOnFrame((const uint8_t*)mapped, (int)f.rtWidth, (int)f.rtHeight,
                           (int)s.previewReadbackPitch, f.frame,
-                          f.headYaw, f.headPitch, f.headRoll, f.headX, f.headY, f.headZ);
+                          f.headYaw, f.headPitch, f.headRoll, f.headX, f.headY, f.headZ,
+                          f.proj);
     }
 
     // The detector samples the aligned readback rows in place; no repack. Before it

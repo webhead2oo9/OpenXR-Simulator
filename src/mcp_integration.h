@@ -961,7 +961,8 @@ inline void BurstFlush() {
 
 inline void BurstOnFrame(const uint8_t* bits, int w, int h, int stride, uint32_t frameCount,
                          float headYaw, float headPitch, float headRoll,
-                         float headX, float headY, float headZ) {
+                         float headX, float headY, float headZ,
+                         const ProjLogEntry& projection) {
     if (!g_burstActive || !bits || w <= 0 || h <= 0) return;
     if (g_burstW == 0) {
         g_burstW = (uint32_t)w;
@@ -982,7 +983,7 @@ inline void BurstOnFrame(const uint8_t* bits, int w, int h, int stride, uint32_t
     m.frame = frameCount;
     m.headYaw = headYaw; m.headPitch = headPitch; m.headRoll = headRoll;
     m.headX = headX; m.headY = headY; m.headZ = headZ;
-    m.proj = g_lastProjEntry;
+    m.proj = projection;
     m.tMs = (double)GetTickCount64();
     g_burstMeta.push_back(m);
 

@@ -27,21 +27,23 @@ A lightweight OpenXR runtime that enables VR applications to run in a desktop wi
 
 - Windows 10/11 (64-bit)
 - DirectX 11/12 or OpenGL compatible GPU
-- Visual Studio 2022 (for building from source)
-- CMake 3.20 or later (for building from source)
 
 ### Installation
 
-1. Download the latest release from the [Releases](https://github.com/yourusername/OpenXR-Simulator/releases) page
-2. Extract the archive to your preferred location
-3. Run PowerShell as Administrator
-4. Navigate to the `scripts` folder
-5. Run `.\register-runtime.ps1` to set as active OpenXR runtime
+1. Download the Windows ZIP from the [Releases](https://github.com/webhead2oo9/OpenXR-Simulator/releases) page.
+2. Extract the entire ZIP to a permanent folder.
+3. Double-click **Activate Simulator.cmd** and approve the administrator prompt.
 
 ```powershell
-cd C:\Path\To\OpenXR-Simulator\scripts
-.\register-runtime.ps1
+cd C:\Path\To\OpenXR-Simulator
+.\activate_simulator.ps1
 ```
+
+Keep the extracted files together and do not move the folder while the simulator
+is active. The package includes the normal 64-bit runtime plus an x86 DLL and
+manifest for 32-bit development tools. To launch a 32-bit application without
+changing the machine-wide runtime, set `XR_RUNTIME_JSON` for that process to the
+full path of `openxr_simulator-32.json`.
 
 ### Usage
 
@@ -63,20 +65,25 @@ Once registered, any OpenXR application will automatically use the simulator:
 To restore your previous OpenXR runtime:
 
 ```powershell
-cd C:\Path\To\OpenXR-Simulator\scripts
-.\unregister-runtime.ps1
+cd C:\Path\To\OpenXR-Simulator
+.\deactivate_simulator.ps1
 ```
+
+You can also double-click **Deactivate Simulator.cmd**.
 
 ## 🛠️ Building from Source
 
 ### Clone the Repository
 
 ```bash
-git clone https://github.com/yourusername/OpenXR-Simulator.git
+git clone https://github.com/webhead2oo9/OpenXR-Simulator.git
 cd OpenXR-Simulator
 ```
 
 ### Build with CMake
+
+Building from source requires Visual Studio 2022 with the C++ toolchain, CMake
+3.20 or later, and Vulkan headers (normally installed with the Vulkan SDK).
 
 ```bash
 mkdir build
@@ -85,7 +92,15 @@ cmake .. -G "Visual Studio 17 2022" -A x64
 cmake --build . --config Release
 ```
 
-The built runtime will be in `build/bin/Release/openxr_simulator.dll`
+The built runtime will be in `bin/openxr_simulator.dll`.
+
+### Release automation
+
+GitHub Actions builds and tests both x64 and x86 for every push and pull request,
+then assembles one ready-to-extract Windows ZIP containing both runtimes, portable
+manifests, activation helpers, documentation, and the MCP server. To publish a
+release, push a version tag such as `v1.6.0`; after validation passes, the workflow
+uploads the ZIP and its SHA-256 checksum to a GitHub release with generated notes.
 
 ## 🔌 MCP Server
 
@@ -319,9 +334,9 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## 📞 Support
 
-- **Issues**: [GitHub Issues](https://github.com/yourusername/OpenXR-Simulator/issues)
-- **Discussions**: [GitHub Discussions](https://github.com/yourusername/OpenXR-Simulator/discussions)
-- **Documentation**: [Wiki](https://github.com/yourusername/OpenXR-Simulator/wiki)
+- **Issues**: [GitHub Issues](https://github.com/webhead2oo9/OpenXR-Simulator/issues)
+- **Discussions**: [GitHub Discussions](https://github.com/webhead2oo9/OpenXR-Simulator/discussions)
+- **Documentation**: [Wiki](https://github.com/webhead2oo9/OpenXR-Simulator/wiki)
 
 ## 🗺️ Roadmap
 

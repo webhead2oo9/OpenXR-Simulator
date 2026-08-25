@@ -349,15 +349,25 @@ def read_status_file() -> Optional[dict[str, Any]]:
         return None
 
 
-def build_flicker_contact_sheet(incident_dir: Path, max_frames: int = 8) -> Optional[bytes]:
+def select_flicker_preview_frames(incident_dir: Path, max_frames: int = 8) -> list[Path]:
+    """Return the newest complete, numerically ordered preview-frame slice."""
+    return sorted(
+        incident_dir.glob("frame*_preview.bmp"),
+        key=lambda path: int(re.search(r"frame(\d+)", path.name).group(1)),
+    )[-max(2, min(max_frames, 12)):]
+
+
+def build_flicker_contact_sheet(
+    incident_dir: Path,
+    max_frames: int = 8,
+    candidates: Optional[list[Path]] = None,
+) -> Optional[bytes]:
     """Build an in-memory JPEG from simulator-composed preview frames for LLM review."""
     from io import BytesIO
     from PIL import Image, ImageDraw
 
-    candidates = sorted(
-        incident_dir.glob("frame*_preview.bmp"),
-        key=lambda path: int(re.search(r"frame(\d+)", path.name).group(1)),
-    )[-max(2, min(max_frames, 12)):]
+    if candidates is None:
+        candidates = select_flicker_preview_frames(incident_dir, max_frames)
     if len(candidates) < 2:
         return None
     cells = []
@@ -1073,27 +1083,34 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
                 type="text",
                 text="Timed out waiting for a manual composed-preview burst. The simulator may not be rendering new composed projection frames."
             )]
-        # Give the post-trigger ring a short opportunity to finish without making
-        # a partially filled packet look like a detector failure.
-        settle_deadline = min(deadline, time.time() + 1.0)
-        while time.time() < settle_deadline and len(list(incident_dir.glob("frame*_preview.bmp"))) < max_frames:
+        # A packet begins with rolling history, so a simple image-count threshold can
+        # succeed before the requested post-trigger D3D11 frames have even arrived.
+        # The runtime publishes this marker only after its final queued image is durable.
+        completion_file = incident_dir / "capture_complete.json"
+        while time.time() < deadline and not completion_file.exists():
             time.sleep(0.1)
-        contact_sheet = build_flicker_contact_sheet(incident_dir, max_frames)
+        if not completion_file.exists():
+            return [TextContent(
+                type="text",
+                text="The composed-preview incident started but did not finish before the timeout. No partial frame set was returned."
+            )]
+        selected_previews = select_flicker_preview_frames(incident_dir, max_frames)
+        contact_sheet = build_flicker_contact_sheet(
+            incident_dir, max_frames, selected_previews)
         frame_metadata: list[dict[str, Any]] = []
-        for metadata_path in incident_dir.glob("frame*_meta.json"):
+        for preview_path in selected_previews:
+            metadata_path = preview_path.with_name(
+                preview_path.name.replace("_preview.bmp", "_meta.json"))
             try:
                 frame_metadata.append(json.loads(metadata_path.read_text(encoding="utf-8")))
             except (OSError, json.JSONDecodeError):
                 pass
-        frame_metadata.sort(key=lambda item: int(item.get("frame", 0)))
-        # build_flicker_contact_sheet selects the newest max_frames frames; metadata must
-        # describe exactly those same images rather than the oldest head of the packet.
-        selected_metadata = frame_metadata[-max_frames:]
         result = [TextContent(type="text", text=json.dumps({
             "captureSource": "openxr-simulator-composed-preview",
             "incidentDirectory": str(incident_dir),
             "framesAvailable": len(list(incident_dir.glob("frame*_preview.bmp"))),
-            "frames": selected_metadata,
+            "frames": frame_metadata,
+            "captureComplete": True,
             "status": status,
         }, indent=2))]
         if contact_sheet:
@@ -1176,14 +1193,22 @@ async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent | 
                 type="text",
                 text="Timed out waiting for a UI-only burst. No valid quad rectangle may be visible."
             )]
-        settle_deadline = min(deadline, time.time() + 1.0)
-        while time.time() < settle_deadline and len(list(incident_dir.glob("frame*_preview.bmp"))) < max_frames:
+        completion_file = incident_dir / "capture_complete.json"
+        while time.time() < deadline and not completion_file.exists():
             time.sleep(0.1)
-        contact_sheet = build_flicker_contact_sheet(incident_dir, max_frames)
+        if not completion_file.exists():
+            return [TextContent(
+                type="text",
+                text="The UI-only incident started but did not finish before the timeout. No partial frame set was returned."
+            )]
+        selected_previews = select_flicker_preview_frames(incident_dir, max_frames)
+        contact_sheet = build_flicker_contact_sheet(
+            incident_dir, max_frames, selected_previews)
         result = [TextContent(type="text", text=json.dumps({
             "captureSource": "openxr-simulator-ui-quad",
             "incidentDirectory": str(incident_dir),
             "framesAvailable": len(list(incident_dir.glob("frame*_preview.bmp"))),
+            "captureComplete": True,
             "status": status,
         }, indent=2))]
         if contact_sheet:

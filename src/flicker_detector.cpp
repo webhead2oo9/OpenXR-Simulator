@@ -508,6 +508,7 @@ struct PendingFile {
 struct PendingSample {
     std::filesystem::path directory;
     Sample sample;
+    bool completesIncident = false;
 };
 
 struct IoWorker {
@@ -531,16 +532,18 @@ void QueueFile(std::filesystem::path path, std::string contents) {
     worker.wake.notify_one();
 }
 
-void QueueSample(const std::filesystem::path& directory, const Sample& sample) {
+bool QueueSample(const std::filesystem::path& directory, const Sample& sample,
+                 bool completesIncident = false) {
     IoWorker& worker = GetWorker();
     {
         std::lock_guard<std::mutex> guard(worker.mutex);
         // Bound the backlog if storage cannot keep up; dropping a post-incident
         // frame beats growing without limit on the app's memory.
-        if (worker.samples.size() >= 64) return;
-        worker.samples.push_back(PendingSample{ directory, sample });
+        if (worker.samples.size() >= 64) return false;
+        worker.samples.push_back(PendingSample{ directory, sample, completesIncident });
     }
     worker.wake.notify_one();
+    return true;
 }
 
 std::string BuildStatusJson(const State& state, const Sample* sample, uint64_t frame) {
@@ -836,7 +839,15 @@ void WorkerMain() {
             samples.swap(worker.samples);
         }
         for (PendingFile& file : files) AtomicWrite(file.path, file.contents);
-        for (PendingSample& pending : samples) SaveSample(pending.directory, pending.sample);
+        for (PendingSample& pending : samples) {
+            SaveSample(pending.directory, pending.sample);
+            if (pending.completesIncident) {
+                std::ostringstream complete;
+                complete << "{\n  \"complete\": true,\n  \"finalFrame\": "
+                         << pending.sample.frame << "\n}\n";
+                AtomicWrite(pending.directory / L"capture_complete.json", complete.str());
+            }
+        }
         FlushDirtyStatus();
         PollManualRequests();
         // Prune after the first service cycle, not before it: clearing a large
@@ -964,10 +975,12 @@ void ObservePreview(const uint8_t* bgra, uint32_t width, uint32_t height,
     if (!reason.empty()) BeginIncident(state, reason, frame);
 
     if (!state.activeIncidentDirectory.empty() && state.activeLastSavedFrame != current.frame) {
-        QueueSample(state.activeIncidentDirectory, current);
-        state.activeLastSavedFrame = current.frame;
-        if (state.postFramesRemaining > 0) --state.postFramesRemaining;
-        if (state.postFramesRemaining == 0) state.activeIncidentDirectory.clear();
+        const bool completesIncident = state.postFramesRemaining == 1;
+        if (QueueSample(state.activeIncidentDirectory, current, completesIncident)) {
+            state.activeLastSavedFrame = current.frame;
+            if (state.postFramesRemaining > 0) --state.postFramesRemaining;
+            if (state.postFramesRemaining == 0) state.activeIncidentDirectory.clear();
+        }
     }
     if (state.previewSamples % 15 == 0 || !reason.empty()) {
         state.statusDirty = true;
@@ -1067,10 +1080,12 @@ void ObserveUi(const uint8_t* bgra, uint32_t width, uint32_t height,
     if (!reason.empty()) BeginUiIncident(state, reason, frame);
     if (!current.bgra.empty()) {
         if (!state.activeIncidentDirectory.empty() && state.activeLastSavedFrame != current.frame) {
-            QueueSample(state.activeIncidentDirectory, current);
-            state.activeLastSavedFrame = current.frame;
-            if (state.postFramesRemaining > 0) --state.postFramesRemaining;
-            if (state.postFramesRemaining == 0) state.activeIncidentDirectory.clear();
+            const bool completesIncident = state.postFramesRemaining == 1;
+            if (QueueSample(state.activeIncidentDirectory, current, completesIncident)) {
+                state.activeLastSavedFrame = current.frame;
+                if (state.postFramesRemaining > 0) --state.postFramesRemaining;
+                if (state.postFramesRemaining == 0) state.activeIncidentDirectory.clear();
+            }
         }
         state.lastMetrics = MetricsOnly(current);
         state.hasMetrics = true;
