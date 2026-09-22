@@ -126,18 +126,13 @@ pip install -e .
 python openxr_simulator_mcp.py
 ```
 
-Point your MCP client at the script (e.g. for Claude Code):
+Register it with Claude Code:
 
-```json
-{
-  "mcpServers": {
-    "openxr-simulator": {
-      "command": "python",
-      "args": ["path/to/mcp-server/openxr_simulator_mcp.py"]
-    }
-  }
-}
+```bash
+claude mcp add openxr-simulator --scope user -- python C:/path/to/OpenXR-Simulator/mcp-server/openxr_simulator_mcp.py
 ```
+
+Other MCP clients take the same command in their `mcpServers` config.
 
 See the [MCP server README](mcp-server/README.md) for full tool documentation.
 
